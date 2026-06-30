@@ -77,6 +77,9 @@ struct Window {
     fullscreen: bool,
     /// Whether `fullscreen` was applied last manage pass (to emit exit_fullscreen).
     applied_fullscreen: bool,
+    /// Whether we've told the client to use server-side decoration (no titlebar).
+    /// hlwm-style: the WM owns all decoration; clients draw none.
+    ssd_applied: bool,
     /// Pseudotile: keep natural size, centered in the tile instead of filling it.
     pseudotile: bool,
     /// Floating: positioned freely at `float_geo`, above the tiled layout.
@@ -103,6 +106,7 @@ impl Window {
             dims: (0, 0),
             fullscreen: false,
             applied_fullscreen: false,
+            ssd_applied: false,
             pseudotile: false,
             floating: false,
             float_geo: Rect::new(0, 0, 0, 0),
@@ -594,6 +598,16 @@ impl State {
     /// set_tiled, fullscreen, close, focus, interactive ops). Runs between
     /// `manage_start` and `manage_finish`.
     fn do_manage(&mut self) {
+        // Tell every new window to use server-side decoration so it draws no
+        // titlebar/borders of its own — sfwm owns all decoration, like hlwm.
+        // (No effect on clients that only support CSD.)
+        for w in self.windows.values_mut() {
+            if !w.ssd_applied {
+                w.win.use_ssd();
+                w.ssd_applied = true;
+            }
+        }
+
         // Enabling bindings is window-management state — do it inside the sequence.
         for b in self.pending_enable.drain(..) {
             b.enable();
