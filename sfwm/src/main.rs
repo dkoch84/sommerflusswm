@@ -466,7 +466,17 @@ impl State {
                 } else {
                     self.window_gap
                 };
-                for p in tree.placements(usable, gap) {
+                // Inset the tiling area by the gap so the margin is uniform on
+                // every side — including the monitor edge. Without this, edge
+                // windows sit flush and their outer border (drawn just outside
+                // the content box) is clipped off-screen.
+                let area = Rect::new(
+                    usable.x + gap,
+                    usable.y + gap,
+                    (usable.w - 2 * gap).max(0),
+                    (usable.h - 2 * gap).max(0),
+                );
+                for p in tree.placements(area, gap) {
                     if self.windows.get(&p.win).map_or(false, |w| w.floating) {
                         continue;
                     }
