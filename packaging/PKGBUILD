@@ -1,7 +1,7 @@
 # Maintainer: the sommerfluss authors
 pkgname=sommerfluss
 pkgver=0.1.0
-pkgrel=5
+pkgrel=6
 pkgdesc="herbstluftwm successor on river: sfwm window manager + sc control client (monitors, keybinds, frame tree, fullscreen/float/mouse/rules/borders)"
 arch=('x86_64')
 url="https://github.com/dkoch84/sommerflusswm"
