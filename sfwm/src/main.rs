@@ -23,6 +23,8 @@ use monitor::{Monitors, Rect, TagId};
 use protocol::*;
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write as _;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 use calloop::generic::Generic;
@@ -288,6 +290,8 @@ struct State {
     pending_close: Vec<WinId>,
     pending_op_start: Vec<(RiverSeatV1, bool)>, // (seat, resize?)
     pending_op_end: Vec<RiverSeatV1>,
+    /// Connected `sc --idle` clients receiving the hook stream (hlwm `--idle`).
+    idle_clients: Vec<UnixStream>,
 }
 
 impl State {
@@ -297,6 +301,19 @@ impl State {
         if let Some(wm) = &self.wm {
             wm.manage_dirty();
         }
+    }
+
+    /// Emit a hook to every connected `sc --idle` client (hlwm `emit_hook`).
+    /// Fields are tab-separated, one hook per line. Dead clients are dropped.
+    fn emit_hook(&mut self, parts: &[&str]) {
+        if self.idle_clients.is_empty() {
+            return;
+        }
+        let mut line = parts.join("\t");
+        line.push('\n');
+        let bytes = line.as_bytes();
+        self.idle_clients
+            .retain_mut(|c| c.write_all(bytes).and_then(|_| c.flush()).is_ok());
     }
 
     /// Tag a new window should land on: the focused monitor's tag, else tag 1.
@@ -501,6 +518,8 @@ impl State {
                 w.raise_seq = seq;
             }
         }
+        let title = self.windows.get(&wid).and_then(|w| w.title.clone()).unwrap_or_default();
+        self.emit_hook(&["focus_changed", &wid.to_string(), &title]);
     }
 
     /// Apply matching rules to a freshly-created window (tag/focus/floating/…).
@@ -1056,6 +1075,7 @@ fn main() {
         pending_close: Vec::new(),
         pending_op_start: Vec::new(),
         pending_op_end: Vec::new(),
+        idle_clients: Vec::new(),
     };
 
     // --- calloop event loop: Wayland + the IPC socket on one thread ---
@@ -1209,7 +1229,11 @@ impl Dispatch<RiverWindowV1, ()> for State {
             Event::Title { title } => {
                 if let Some(&wid) = state.win_by_obj.get(&id) {
                     if let Some(w) = state.windows.get_mut(&wid) {
-                        w.title = title;
+                        w.title = title.clone();
+                    }
+                    if Some(wid) == state.focused_window() {
+                        let t = title.unwrap_or_default();
+                        state.emit_hook(&["window_title_changed", &wid.to_string(), &t]);
                     }
                     state.reapply_rules(wid);
                 }

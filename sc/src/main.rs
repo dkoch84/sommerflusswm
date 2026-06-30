@@ -58,6 +58,28 @@ fn main() -> ExitCode {
     let _ = stream.flush();
     let _ = stream.shutdown(std::net::Shutdown::Write);
 
+    // `sc --idle` keeps the connection open and streams hook lines as they
+    // arrive (one per line), until sfwm exits or the pipe is closed.
+    if matches!(args.first().map(String::as_str), Some("--idle") | Some("-i")) {
+        let mut buf = [0u8; 4096];
+        let mut out = std::io::stdout();
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break, // sfwm closed the connection
+                Ok(n) => {
+                    if out.write_all(&buf[..n]).and_then(|_| out.flush()).is_err() {
+                        break; // our stdout went away (downstream pipe closed)
+                    }
+                }
+                Err(e) => {
+                    eprintln!("sc: idle read failed: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+
     let mut reply = String::new();
     if let Err(e) = stream.read_to_string(&mut reply) {
         eprintln!("sc: read failed: {e}");

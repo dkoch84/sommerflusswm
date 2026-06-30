@@ -36,6 +36,14 @@ pub fn handle_connection(mut stream: UnixStream, state: &mut State) {
         .map(|s| String::from_utf8_lossy(s).into_owned())
         .collect();
 
+    // `sc --idle`: keep the connection open and stream hooks to it. The client
+    // half-closed its write side (as every client does), so we only ever write.
+    if matches!(args.first().map(String::as_str), Some("--idle") | Some("-i")) {
+        let _ = stream.set_read_timeout(None);
+        state.idle_clients.push(stream);
+        return;
+    }
+
     let reply = dispatch(state, &args);
     let _ = stream.write_all(reply.as_bytes());
     let _ = stream.flush();
@@ -121,6 +129,12 @@ pub(crate) fn dispatch(state: &mut State, args: &[String]) -> String {
         "list_outputs" => list_outputs(state),
         "list_keybinds" => list_keybinds(state),
         "list_rules" => list_rules(state),
+        "tag_status" => tag_status(state, rest),
+        "emit_hook" => {
+            let parts: Vec<&str> = rest.iter().map(|s| s.as_str()).collect();
+            state.emit_hook(&parts);
+            ok()
+        }
         "version" => format!("sommerfluss {}\n", env!("CARGO_PKG_VERSION")),
         "dump" => cmd_dump_layout(state, rest),
         "load" => cmd_load(state, rest),
@@ -321,8 +335,16 @@ fn cmd_use(state: &mut State, rest: &[String]) -> String {
     }
     state.remember_prev_tag();
     state.monitors.show_on_focused(tag);
+    emit_tag_changed(state);
     state.request_manage();
     ok()
+}
+
+/// Emit the `tag_changed <tag> <monitor>` hook for the focused monitor.
+fn emit_tag_changed(state: &mut State) {
+    let tag = state.focused_tag().to_string();
+    let mon = state.monitors.focus.to_string();
+    state.emit_hook(&["tag_changed", &tag, &mon]);
 }
 
 /// `use_previous` — toggle the focused monitor back to the tag it last showed.
@@ -332,6 +354,7 @@ fn cmd_use_previous(state: &mut State) -> String {
     };
     state.remember_prev_tag();
     state.monitors.show_on_focused(prev);
+    emit_tag_changed(state);
     state.request_manage();
     ok()
 }
@@ -406,6 +429,7 @@ fn cmd_use_index(state: &mut State, rest: &[String]) -> String {
 
     state.remember_prev_tag();
     state.monitors.show_on_focused(target_tag);
+    emit_tag_changed(state);
     state.request_manage();
     ok()
 }
@@ -1008,6 +1032,40 @@ fn list_keybinds(state: &State) -> String {
     } else {
         out
     }
+}
+
+/// `tag_status [monitor]` — a panel-friendly view of tags 1..9 for the given
+/// monitor (default: focused). Each entry is `<prefix><tag>`, tab-separated:
+///   `#` focused here · `%` visible on another monitor · `!` urgent ·
+///   `:` occupied (has windows) · `.` empty.
+fn tag_status(state: &State, rest: &[String]) -> String {
+    let mon_idx = match rest.first() {
+        Some(s) => state.monitors.resolve(&MonitorSel::parse(s)).unwrap_or(state.monitors.focus),
+        None => state.monitors.focus,
+    };
+    let cur_tag = state.monitors.list.get(mon_idx).map(|m| m.tag);
+    let mut out = String::new();
+    for tag in 1..=9u32 {
+        let occupied = state.tags.get(&tag).map_or(false, |t| !t.all_windows().is_empty());
+        let urgent = state.windows.values().any(|w| w.tag == tag && w.urgent);
+        let visible = state.monitors.tag_visible(tag);
+        let prefix = if Some(tag) == cur_tag {
+            '#'
+        } else if urgent {
+            '!'
+        } else if visible {
+            '%'
+        } else if occupied {
+            ':'
+        } else {
+            '.'
+        };
+        out.push(prefix);
+        out.push_str(&tag.to_string());
+        out.push('\t');
+    }
+    out.push('\n');
+    out
 }
 
 fn list_rules(state: &State) -> String {
