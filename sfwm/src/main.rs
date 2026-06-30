@@ -359,6 +359,33 @@ impl State {
         self.tag_tree_mut(tag)
     }
 
+    /// Replace `tag`'s frame tree from a serialized layout string (hlwm `load`).
+    /// Window ids that no longer exist are dropped; windows currently on the tag
+    /// but absent from the new layout are appended so nothing is lost.
+    fn load_layout(&mut self, tag: TagId, s: &str) -> Result<(), String> {
+        let mut frame = Frame::deserialize(s).ok_or("load: malformed layout string")?;
+        let existing: HashSet<WinId> = self.windows.keys().copied().collect();
+        frame.retain_windows(&existing);
+        let in_new: HashSet<WinId> = frame.all_windows().into_iter().collect();
+        let orphans: Vec<WinId> = self
+            .windows
+            .iter()
+            .filter(|(wid, w)| w.tag == tag && !in_new.contains(wid))
+            .map(|(wid, _)| *wid)
+            .collect();
+        for w in orphans {
+            frame.insert_window(w);
+        }
+        for wid in frame.all_windows() {
+            if let Some(w) = self.windows.get_mut(&wid) {
+                w.tag = tag;
+            }
+        }
+        self.tags.insert(tag, frame);
+        self.request_manage();
+        Ok(())
+    }
+
     /// Lay out every placed window across all monitors, in render order
     /// (bottom → top by monitor `z`, then by layer: tiled < floating < fullscreen).
     /// Tiled windows come from each tag's frame tree; floating windows live only

@@ -608,6 +608,133 @@ impl Frame {
     }
 }
 
+// --- serialization (hlwm `dump`/`load`) ----------------------------------------
+
+impl Frame {
+    /// Serialize the tree to an s-expression layout string (hlwm `dump`):
+    ///   `(split horizontal:0.5000:0 (clients vertical:0 1 2) (clients max:0 3))`
+    /// Window ids are this run's `WinId`s. Round-trips with [`Frame::deserialize`].
+    pub fn serialize(&self) -> String {
+        let mut s = String::new();
+        self.write_sexpr(&mut s);
+        s
+    }
+
+    fn write_sexpr(&self, out: &mut String) {
+        use std::fmt::Write;
+        match self {
+            Frame::Leaf(l) => {
+                let lay = match l.layout {
+                    LayoutMode::Max => "max",
+                    LayoutMode::Vertical => "vertical",
+                    LayoutMode::Horizontal => "horizontal",
+                    LayoutMode::Grid => "grid",
+                };
+                let _ = write!(out, "(clients {lay}:{}", l.selected);
+                for w in &l.windows {
+                    let _ = write!(out, " {w}");
+                }
+                out.push(')');
+            }
+            Frame::Split(s) => {
+                let o = match s.orient {
+                    Orientation::Horizontal => "horizontal",
+                    Orientation::Vertical => "vertical",
+                };
+                let _ = write!(out, "(split {o}:{:.4}:{} ", s.ratio, s.selection);
+                s.children[0].write_sexpr(out);
+                out.push(' ');
+                s.children[1].write_sexpr(out);
+                out.push(')');
+            }
+        }
+    }
+
+    /// Parse a layout string produced by [`Frame::serialize`]. Returns `None` on
+    /// malformed input.
+    pub fn deserialize(s: &str) -> Option<Frame> {
+        let spaced = s.replace('(', " ( ").replace(')', " ) ");
+        let mut toks = spaced.split_whitespace().peekable();
+        let frame = parse_node(&mut toks)?;
+        // Reject trailing junk.
+        if toks.next().is_some() {
+            return None;
+        }
+        Some(frame)
+    }
+
+    /// Remove any window not in `keep` (used after loading a layout whose ids
+    /// may no longer all exist).
+    pub fn retain_windows(&mut self, keep: &std::collections::HashSet<WinId>) {
+        match self {
+            Frame::Leaf(l) => {
+                l.windows.retain(|w| keep.contains(w));
+                if l.selected >= l.windows.len() {
+                    l.selected = l.windows.len().saturating_sub(1);
+                }
+            }
+            Frame::Split(s) => {
+                s.children[0].retain_windows(keep);
+                s.children[1].retain_windows(keep);
+            }
+        }
+    }
+}
+
+fn parse_node<'a, I: Iterator<Item = &'a str>>(
+    toks: &mut std::iter::Peekable<I>,
+) -> Option<Frame> {
+    if toks.next()? != "(" {
+        return None;
+    }
+    let kind = toks.next()?;
+    match kind {
+        "clients" => {
+            // "<layout>:<selected>"
+            let head = toks.next()?;
+            let (lay, sel) = head.split_once(':')?;
+            let layout = LayoutMode::parse(lay)?;
+            let selected: usize = sel.parse().ok()?;
+            let mut windows = Vec::new();
+            loop {
+                match toks.next()? {
+                    ")" => break,
+                    w => windows.push(w.parse::<WinId>().ok()?),
+                }
+            }
+            let selected = if windows.is_empty() { 0 } else { selected.min(windows.len() - 1) };
+            Some(Frame::Leaf(Leaf { windows, selected, layout }))
+        }
+        "split" => {
+            // "<orient>:<ratio>:<selection>"
+            let head = toks.next()?;
+            let mut parts = head.split(':');
+            let orient = match parts.next()? {
+                "horizontal" => Orientation::Horizontal,
+                "vertical" => Orientation::Vertical,
+                _ => return None,
+            };
+            let ratio: f64 = parts.next()?.parse().ok()?;
+            let selection: usize = parts.next()?.parse().ok()?;
+            if selection > 1 {
+                return None;
+            }
+            let c0 = parse_node(toks)?;
+            let c1 = parse_node(toks)?;
+            if toks.next()? != ")" {
+                return None;
+            }
+            Some(Frame::Split(Split {
+                orient,
+                ratio: ratio.clamp(0.05, 0.95),
+                selection,
+                children: [Box::new(c0), Box::new(c1)],
+            }))
+        }
+        _ => None,
+    }
+}
+
 // --- free helpers --------------------------------------------------------------
 
 /// Split `area` into two by `orient`/`ratio`, leaving `gap` between.
@@ -881,6 +1008,38 @@ mod tests {
         assert_eq!(leaves.len(), 2);
         assert_eq!(f.focused_window(), Some(3));
         assert_eq!(f.all_windows().len(), 3);
+    }
+
+    #[test]
+    fn serialize_round_trips() {
+        let mut f = Frame::new();
+        f.insert_window(1);
+        f.insert_window(2);
+        f.split(SplitDir::Right, 0.5);
+        f.focus_dir(Dir::Right, area(), 0);
+        f.insert_window(3);
+        f.set_layout(LayoutMode::Max);
+
+        let dumped = f.serialize();
+        let back = Frame::deserialize(&dumped).expect("parse");
+        // Same structure & windows survive a round trip.
+        assert_eq!(back.serialize(), dumped);
+        assert_eq!(back.all_windows().len(), 3);
+        assert!(dumped.starts_with("(split horizontal:"));
+        assert!(dumped.contains("(clients max:"));
+
+        // Malformed input is rejected, not panicked.
+        assert!(Frame::deserialize("(split horizontal:0.5:0 (clients max:0 1))").is_none());
+        assert!(Frame::deserialize("garbage").is_none());
+    }
+
+    #[test]
+    fn retain_drops_absent_windows() {
+        let mut f = Frame::deserialize("(clients vertical:1 5 6 7)").unwrap();
+        let keep: std::collections::HashSet<WinId> = [6u64].into_iter().collect();
+        f.retain_windows(&keep);
+        assert_eq!(f.all_windows(), vec![6]);
+        assert_eq!(f.focused_window(), Some(6));
     }
 
     #[test]

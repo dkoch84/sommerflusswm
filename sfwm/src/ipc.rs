@@ -122,7 +122,9 @@ pub(crate) fn dispatch(state: &mut State, args: &[String]) -> String {
         "list_keybinds" => list_keybinds(state),
         "list_rules" => list_rules(state),
         "version" => format!("sommerfluss {}\n", env!("CARGO_PKG_VERSION")),
-        "dump" => cmd_dump(state),
+        "dump" => cmd_dump_layout(state, rest),
+        "load" => cmd_load(state, rest),
+        "dump_tree" => cmd_dump_tree(state),
         "quit" => {
             std::process::exit(0);
         }
@@ -922,9 +924,38 @@ fn list_clients(state: &State) -> String {
     out
 }
 
+/// `dump [tag]` — serialize a tag's frame tree to a loadable layout string
+/// (hlwm `dump`). Default: the focused tag.
+fn cmd_dump_layout(state: &State, rest: &[String]) -> String {
+    let tag = rest.first().and_then(|s| parse_tag(s)).unwrap_or_else(|| state.focused_tag());
+    match state.tags.get(&tag) {
+        Some(t) => format!("{}\n", t.serialize()),
+        None => "(clients vertical:0)\n".to_string(),
+    }
+}
+
+/// `load [tag] <layout>` — restore a tag's frame tree from a layout string
+/// (hlwm `load`). If the first token is a bare tag number it selects the tag;
+/// otherwise the whole argument list is the layout for the focused tag.
+fn cmd_load(state: &mut State, rest: &[String]) -> String {
+    if rest.is_empty() {
+        return err("load: expected [tag] <layout>");
+    }
+    let first_is_tag = !rest[0].starts_with('(') && parse_tag(&rest[0]).is_some() && rest.len() > 1;
+    let (tag, layout) = if first_is_tag {
+        (parse_tag(&rest[0]).unwrap(), rest[1..].join(" "))
+    } else {
+        (state.focused_tag(), rest.join(" "))
+    };
+    match state.load_layout(tag, &layout) {
+        Ok(()) => ok(),
+        Err(e) => err(&e),
+    }
+}
+
 /// Inspect the focused tag's frame tree and the rects it computes — lets the
 /// frame tree be verified headlessly (no display needed).
-fn cmd_dump(state: &State) -> String {
+fn cmd_dump_tree(state: &State) -> String {
     let tag = state.focused_tag();
     let area = state.focused_area();
     let gap = state.window_gap;
