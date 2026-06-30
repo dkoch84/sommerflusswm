@@ -131,8 +131,21 @@ struct Rule {
     app_id: Option<(bool, String)>,
     title: Option<(bool, String)>,
     tag: Option<TagId>,
+    /// Place the window on whatever tag this monitor currently shows.
+    monitor: Option<monitor::MonitorSel>,
     floating: Option<bool>,
     pseudotile: Option<bool>,
+    /// Focus the window when it appears.
+    focus: Option<bool>,
+    /// Switch the focused monitor to the window's tag (follow it).
+    switchtag: Option<bool>,
+}
+
+/// What applying the rules to a window decided (consumed by `reapply_rules`).
+struct RuleOutcome {
+    tag: TagId,
+    focus: bool,
+    switchtag: bool,
 }
 
 impl Rule {
@@ -148,11 +161,20 @@ impl Rule {
         if let Some(t) = self.tag {
             p.push(format!("tag={t}"));
         }
+        if let Some(m) = &self.monitor {
+            p.push(format!("monitor={m:?}"));
+        }
         if let Some(f) = self.floating {
             p.push(format!("floating={}", if f { "on" } else { "off" }));
         }
         if let Some(ps) = self.pseudotile {
             p.push(format!("pseudotile={}", if ps { "on" } else { "off" }));
+        }
+        if self.focus == Some(true) {
+            p.push("focus=on".into());
+        }
+        if self.switchtag == Some(true) {
+            p.push("switchtag=on".into());
         }
         p.join(" ")
     }
@@ -240,6 +262,8 @@ struct State {
     rules: Vec<Rule>,
     /// hlwm `my_monitor`: a tag's home monitor, focused first by `use`.
     tag_monitor: HashMap<TagId, monitor::MonitorSel>,
+    /// Previously-displayed tag per monitor index (hlwm `use_previous`).
+    prev_tag: HashMap<usize, TagId>,
 
     // --- pointer bindings & interactive ops ---
     /// Pointer bindings keyed by binding id.
@@ -296,6 +320,14 @@ impl State {
     /// Tag of the focused monitor (where new windows and frame commands act).
     fn focused_tag(&self) -> TagId {
         self.monitors.focused().map(|m| m.tag).unwrap_or(1)
+    }
+
+    /// Record the focused monitor's current tag as its "previous" tag, before a
+    /// tag switch, so `use_previous` can toggle back (hlwm).
+    fn remember_prev_tag(&mut self) {
+        if let Some(m) = self.monitors.focused() {
+            self.prev_tag.insert(self.monitors.focus, m.tag);
+        }
     }
 
     /// Usable rect of the focused monitor (the area its frame tree lays out in).
@@ -421,14 +453,16 @@ impl State {
     }
 
     /// Apply matching rules to a freshly-created window (tag/focus/floating/…).
-    /// Returns the tag the window should live on.
-    fn apply_rules(&mut self, wid: WinId) -> TagId {
+    /// Returns the resolved tag plus the focus/switchtag consequences.
+    fn apply_rules(&mut self, wid: WinId) -> RuleOutcome {
         let (app_id, title, mut tag) = {
             let w = &self.windows[&wid];
             (w.app_id.clone(), w.title.clone(), w.tag)
         };
         let mut want_floating = None;
         let mut want_pseudotile = None;
+        let mut want_focus = false;
+        let mut want_switchtag = false;
         for r in &self.rules {
             if let Some((exact, pat)) = &r.app_id {
                 if !match_field(app_id.as_deref(), *exact, pat) {
@@ -443,11 +477,23 @@ impl State {
             if let Some(t) = r.tag {
                 tag = t;
             }
+            // `monitor=` places the window on whatever tag that monitor shows.
+            if let Some(sel) = &r.monitor {
+                if let Some(t) = self.monitors.tag_of(sel) {
+                    tag = t;
+                }
+            }
             if let Some(f) = r.floating {
                 want_floating = Some(f);
             }
             if let Some(p) = r.pseudotile {
                 want_pseudotile = Some(p);
+            }
+            if let Some(f) = r.focus {
+                want_focus = f;
+            }
+            if let Some(s) = r.switchtag {
+                want_switchtag = s;
             }
         }
         if let Some(w) = self.windows.get_mut(&wid) {
@@ -459,7 +505,7 @@ impl State {
                 w.pseudotile = p;
             }
         }
-        tag
+        RuleOutcome { tag, focus: want_focus, switchtag: want_switchtag }
     }
 
     /// Apply rules once, the first time app_id/title is known, moving the window
@@ -475,7 +521,8 @@ impl State {
         if let Some(w) = self.windows.get_mut(&wid) {
             w.rules_applied = true;
         }
-        let new_tag = self.apply_rules(wid);
+        let outcome = self.apply_rules(wid);
+        let new_tag = outcome.tag;
         let floating = self.windows.get(&wid).map_or(false, |w| w.floating);
         if new_tag != old_tag {
             if let Some(t) = self.tags.get_mut(&old_tag) {
@@ -486,6 +533,14 @@ impl State {
         if floating {
             let geo = self.default_float_geo();
             self.make_floating(wid, geo);
+        }
+        // switchtag: pull the window's tag onto the focused monitor (follow it).
+        if outcome.switchtag {
+            self.monitors.show_on_focused(new_tag);
+        }
+        // focus: select the window (and the monitor showing its tag).
+        if outcome.focus {
+            self.focus_window_by_id(wid);
         }
         self.request_manage();
     }
@@ -923,6 +978,7 @@ fn main() {
         next_raise: 1,
         rules: Vec::new(),
         tag_monitor: HashMap::new(),
+        prev_tag: HashMap::new(),
         pointer_binds: HashMap::new(),
         pending_pointer_enable: Vec::new(),
         pointer_focus: None,

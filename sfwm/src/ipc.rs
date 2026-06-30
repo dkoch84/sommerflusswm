@@ -70,6 +70,8 @@ pub(crate) fn dispatch(state: &mut State, args: &[String]) -> String {
         "shift_to_monitor" => cmd_shift_to_monitor(state, rest),
         "use" => cmd_use(state, rest),
         "use_index" => cmd_use_index(state, rest),
+        "use_previous" => cmd_use_previous(state),
+        "merge_tag" => cmd_merge_tag(state, rest),
         "move" => cmd_move(state, rest),
         "bring" => cmd_bring(state, rest),
         "jumpto" => cmd_jumpto(state, rest),
@@ -315,7 +317,43 @@ fn cmd_use(state: &mut State, rest: &[String]) -> String {
     if let Some(sel) = state.tag_monitor.get(&tag).cloned() {
         state.monitors.focus_monitor(&sel);
     }
+    state.remember_prev_tag();
     state.monitors.show_on_focused(tag);
+    state.request_manage();
+    ok()
+}
+
+/// `use_previous` — toggle the focused monitor back to the tag it last showed.
+fn cmd_use_previous(state: &mut State) -> String {
+    let Some(prev) = state.prev_tag.get(&state.monitors.focus).copied() else {
+        return ok(); // nothing shown before yet
+    };
+    state.remember_prev_tag();
+    state.monitors.show_on_focused(prev);
+    state.request_manage();
+    ok()
+}
+
+/// `merge_tag <src> [target]` — move every window from tag `src` into `target`
+/// (default: the focused tag), then leave `src` empty.
+fn cmd_merge_tag(state: &mut State, rest: &[String]) -> String {
+    let Some(src) = rest.first().and_then(|s| parse_tag(s)) else {
+        return err("merge_tag: expected <src> [target]");
+    };
+    let target = rest.get(1).and_then(|s| parse_tag(s)).unwrap_or_else(|| state.focused_tag());
+    if src == target {
+        return ok();
+    }
+    let windows = state.tags.get(&src).map(|t| t.all_windows()).unwrap_or_default();
+    if let Some(t) = state.tags.get_mut(&src) {
+        *t = frame::Frame::new();
+    }
+    for wid in windows {
+        if let Some(w) = state.windows.get_mut(&wid) {
+            w.tag = target;
+        }
+        state.tag_tree_mut(target).insert_window(wid);
+    }
     state.request_manage();
     ok()
 }
@@ -364,6 +402,7 @@ fn cmd_use_index(state: &mut State, rest: &[String]) -> String {
         }
     };
 
+    state.remember_prev_tag();
     state.monitors.show_on_focused(target_tag);
     state.request_manage();
     ok()
@@ -684,8 +723,11 @@ fn cmd_rule(state: &mut State, rest: &[String]) -> String {
         app_id: None,
         title: None,
         tag: None,
+        monitor: None,
         floating: None,
         pseudotile: None,
+        focus: None,
+        switchtag: None,
     };
     for tok in rest {
         let (key, exact, val) = if let Some(i) = tok.find('~') {
@@ -695,15 +737,18 @@ fn cmd_rule(state: &mut State, rest: &[String]) -> String {
         } else {
             continue;
         };
-        let on = matches!(val, "on" | "true" | "1");
+        let on = parse_bool(val);
         match key {
             "app_id" | "class" | "instance" => rule.app_id = Some((exact, val.to_string())),
             "title" => rule.title = Some((exact, val.to_string())),
             "tag" => rule.tag = parse_tag(val),
+            "monitor" => rule.monitor = Some(MonitorSel::parse(val)),
             "floating" => rule.floating = Some(on),
             "pseudotile" => rule.pseudotile = Some(on),
+            "focus" => rule.focus = Some(on),
+            "switchtag" => rule.switchtag = Some(on),
             // accepted but not yet acted on
-            "focus" | "manage" | "windowtype" | "switchtag" => {}
+            "manage" | "windowtype" => {}
             _ => {}
         }
     }
