@@ -12,6 +12,9 @@ path = "src/main.rs"
 wayland-client = "0.31"
 wayland-scanner = "0.31"
 wayland-backend = "0.3"
+# viewporter + single-pixel-buffer: scale a 1x1 dim buffer over inactive windows
+# (in-WM "dim inactive" decoration, replacing a picom effect).
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 bitflags = "2"
 calloop = "0.14"
 calloop-wayland-source = "0.4"

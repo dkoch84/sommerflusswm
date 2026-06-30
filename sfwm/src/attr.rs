@@ -98,6 +98,7 @@ fn settings_get(state: &State, name: &str) -> Result<String, String> {
         "smart_frame_surroundings" => boolstr(state.smart_frame_surroundings),
         "smart_window_surroundings" => boolstr(state.smart_window_surroundings),
         "default_frame_layout" => layout_name(state.default_frame_layout),
+        "inactive_dim" => format!("{:.2}", state.inactive_dim),
         _ => return Err(format!("no such setting: {name}")),
     })
 }
@@ -317,6 +318,7 @@ pub fn list(state: &State, path: Option<&str>) -> String {
             "smart_frame_surroundings",
             "smart_window_surroundings",
             "default_frame_layout",
+            "inactive_dim",
         ],
         "clients.focus" => &["winid", "app_id", "title", "tag", "floating", "fullscreen", "pseudotile", "urgent"],
         _ => return format!("error: no such object: {path}\n"),

@@ -36,9 +36,11 @@ use wayland_client::{
     backend::ObjectId,
     event_created_child,
     globals::{registry_queue_init, GlobalListContents},
-    protocol::wl_registry,
+    protocol::{wl_buffer::WlBuffer, wl_compositor::WlCompositor, wl_registry, wl_surface::WlSurface},
     Connection, Dispatch, Proxy, QueueHandle,
 };
+use wayland_protocols::wp::single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1;
+use wayland_protocols::wp::viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter};
 
 /// Geometry of a river logical output, in logical coordinates.
 #[derive(Default, Clone, Copy)]
@@ -96,6 +98,21 @@ struct Window {
     rules_applied: bool,
     /// Window requested attention (xdg-activation / urgency) and isn't focused.
     urgent: bool,
+    /// The "dim inactive" decoration overlay, created lazily (see [`DimOverlay`]).
+    dim: Option<DimOverlay>,
+}
+
+/// A WM-owned decoration surface drawn *above* an inactive window to dim it
+/// (the in-WM replacement for picom's inactive-dim). The fill is a shared 1x1
+/// single-pixel buffer scaled to the window by a viewport.
+struct DimOverlay {
+    deco: RiverDecorationV1,
+    surface: WlSurface,
+    viewport: WpViewport,
+    /// Whether the overlay currently has the dim buffer attached.
+    shown: bool,
+    /// Last destination size set on the viewport (to avoid redundant commits).
+    size: (i32, i32),
 }
 
 impl Window {
@@ -116,6 +133,7 @@ impl Window {
             raise_seq: 0,
             rules_applied: false,
             urgent: false,
+            dim: None,
         }
     }
 }
@@ -298,6 +316,16 @@ struct State {
     /// True while the monitor topology is auto-derived from outputs (no explicit
     /// `set_monitors`); lets output hotplug re-detect without clobbering a config.
     auto_monitors: bool,
+
+    // --- inactive-window dimming (in-WM, replaces a picom effect) ---
+    /// Globals needed for the dim overlay; absent → dimming silently disabled.
+    compositor: Option<WlCompositor>,
+    viewporter: Option<WpViewporter>,
+    spb: Option<WpSinglePixelBufferManagerV1>,
+    /// Shared 1x1 premultiplied-black buffer at the configured alpha.
+    dim_buffer: Option<WlBuffer>,
+    /// Dim strength for unfocused windows, 0.0 (off) ..= 1.0 (hlwm-ish setting).
+    inactive_dim: f64,
 }
 
 impl State {
@@ -946,6 +974,86 @@ impl State {
         for pair in ordered_nodes.windows(2) {
             pair[1].place_above(&pair[0]);
         }
+
+        self.apply_dim(qh, &layout, focused);
+    }
+
+    /// Dim inactive windows by attaching a semi-transparent decoration surface
+    /// *above* each unfocused, non-fullscreen, visible window (hlwm users do this
+    /// with picom; here it's in-WM). Off when `inactive_dim == 0` or the needed
+    /// globals are absent. Decoration `set_offset`/`sync_next_commit` are render
+    /// state, so this must run inside the render sequence (it does — from
+    /// `do_render`, before `render_finish`).
+    fn apply_dim(&mut self, qh: &QueueHandle<Self>, layout: &[RenderItem], focused: Option<WinId>) {
+        let (Some(comp), Some(vp), Some(spb)) =
+            (self.compositor.clone(), self.viewporter.clone(), self.spb.clone())
+        else {
+            return;
+        };
+        let dim = self.inactive_dim;
+
+        // Lazily (re)create the shared dim buffer at the current alpha.
+        if dim > 0.0 && self.dim_buffer.is_none() {
+            let a = (dim.clamp(0.0, 1.0) * u32::MAX as f64) as u32; // premultiplied black
+            self.dim_buffer = Some(spb.create_u32_rgba_buffer(0, 0, 0, a, qh, ()));
+        }
+        let buffer = self.dim_buffer.clone();
+
+        // Per visible window: should it be dimmed, and at what size?
+        let mut want: HashMap<WinId, Rect> = HashMap::new();
+        if dim > 0.0 {
+            for it in layout {
+                if it.visible && Some(it.win) != focused && it.layer != Layer::Fullscreen {
+                    want.insert(it.win, it.rect);
+                }
+            }
+        }
+
+        let wids: Vec<WinId> = self.windows.keys().copied().collect();
+        for wid in wids {
+            let target = want.get(&wid).copied();
+            let win = match self.windows.get(&wid) {
+                Some(w) => w.win.clone(),
+                None => continue,
+            };
+            match target {
+                Some(rect) => {
+                    let Some(buffer) = buffer.clone() else { continue };
+                    // Create the overlay surface/viewport/decoration on first use.
+                    if self.windows.get(&wid).and_then(|w| w.dim.as_ref()).is_none() {
+                        let surface = comp.create_surface(qh, ());
+                        let viewport = vp.get_viewport(&surface, qh, ());
+                        let deco = win.get_decoration_above(&surface, qh, ());
+                        if let Some(w) = self.windows.get_mut(&wid) {
+                            w.dim = Some(DimOverlay { deco, surface, viewport, shown: false, size: (0, 0) });
+                        }
+                    }
+                    if let Some(o) = self.windows.get_mut(&wid).and_then(|w| w.dim.as_mut()) {
+                        if !o.shown || o.size != (rect.w, rect.h) {
+                            o.surface.attach(Some(&buffer), 0, 0);
+                            o.viewport.set_destination(rect.w.max(1), rect.h.max(1));
+                            o.surface.damage(0, 0, i32::MAX, i32::MAX);
+                            o.deco.set_offset(0, 0);
+                            o.deco.sync_next_commit();
+                            o.surface.commit();
+                            o.shown = true;
+                            o.size = (rect.w, rect.h);
+                        }
+                    }
+                }
+                None => {
+                    // Hide the overlay if it's currently showing.
+                    if let Some(o) = self.windows.get_mut(&wid).and_then(|w| w.dim.as_mut()) {
+                        if o.shown {
+                            o.surface.attach(None, 0, 0);
+                            o.deco.sync_next_commit();
+                            o.surface.commit();
+                            o.shown = false;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1049,6 +1157,12 @@ fn main() {
         }
     };
 
+    // Optional globals for the "dim inactive window" overlay. If any is missing,
+    // dimming is silently disabled (everything else works unchanged).
+    let compositor: Option<WlCompositor> = globals.bind(&qh, 1..=6, ()).ok();
+    let viewporter: Option<WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
+    let spb: Option<WpSinglePixelBufferManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
+
     let mut state = State {
         wm: Some(wm),
         qh: qh.clone(),
@@ -1088,6 +1202,11 @@ fn main() {
         idle_clients: Vec::new(),
         user_attrs: HashMap::new(),
         auto_monitors: true,
+        compositor,
+        viewporter,
+        spb,
+        dim_buffer: None,
+        inactive_dim: 0.0,
     };
 
     // --- calloop event loop: Wayland + the IPC socket on one thread ---
@@ -1224,6 +1343,11 @@ impl Dispatch<RiverWindowV1, ()> for State {
                     if let Some(w) = state.windows.remove(&wid) {
                         if let Some(tree) = state.tags.get_mut(&w.tag) {
                             tree.remove_window(wid);
+                        }
+                        if let Some(o) = w.dim {
+                            o.deco.destroy();
+                            o.viewport.destroy();
+                            o.surface.destroy();
                         }
                     }
                 }
@@ -1434,6 +1558,25 @@ impl Dispatch<RiverXkbBindingV1, ()> for State {
         }
     }
 }
+
+// --- dim-overlay objects: all eventless to us (empty dispatch) ------------------
+
+macro_rules! ignore_events {
+    ($($t:ty),+ $(,)?) => {$(
+        impl Dispatch<$t, ()> for State {
+            fn event(_: &mut Self, _: &$t, _: <$t as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+        }
+    )+};
+}
+ignore_events!(
+    WlCompositor,
+    WlSurface,
+    WlBuffer,
+    WpViewporter,
+    WpViewport,
+    WpSinglePixelBufferManagerV1,
+    RiverDecorationV1,
+);
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
     fn event(

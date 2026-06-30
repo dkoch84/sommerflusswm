@@ -42,11 +42,12 @@ pub mod xkb {
 // Surface the interface submodules and proxy types at the protocol-module root so
 // `use protocol::*` and `protocol::river_seat_v1::…` keep working as before.
 pub use wm::{
-    river_node_v1, river_output_v1, river_pointer_binding_v1, river_seat_v1,
-    river_window_manager_v1, river_window_v1,
+    river_decoration_v1, river_node_v1, river_output_v1, river_pointer_binding_v1,
+    river_seat_v1, river_window_manager_v1, river_window_v1,
 };
 pub use xkb::{river_xkb_binding_v1, river_xkb_bindings_v1};
 
+pub use river_decoration_v1::RiverDecorationV1;
 pub use river_node_v1::RiverNodeV1;
 pub use river_output_v1::RiverOutputV1;
 pub use river_seat_v1::RiverSeatV1;

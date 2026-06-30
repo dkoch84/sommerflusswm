@@ -678,6 +678,17 @@ fn cmd_set(state: &mut State, rest: &[String]) -> String {
             None => return err("set: bad colour (use #rrggbb)"),
         },
         "focus_follows_mouse" => state.focus_follows_mouse = parse_bool(v),
+        "inactive_dim" => match v.parse::<f64>() {
+            Ok(n) => {
+                state.inactive_dim = n.clamp(0.0, 1.0);
+                // Drop the cached buffer so the next render rebuilds it at the
+                // new alpha.
+                if let Some(b) = state.dim_buffer.take() {
+                    b.destroy();
+                }
+            }
+            Err(_) => return err("set inactive_dim: expected a number 0.0..=1.0"),
+        },
         "raise_on_focus" => state.raise_on_focus = parse_bool(v),
         "smart_frame_surroundings" => state.smart_frame_surroundings = parse_bool(v),
         "smart_window_surroundings" => state.smart_window_surroundings = parse_bool(v),
