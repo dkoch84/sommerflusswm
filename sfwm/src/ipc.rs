@@ -66,6 +66,7 @@ pub(crate) fn dispatch(state: &mut State, args: &[String]) -> String {
         "focus_monitor" => cmd_focus_monitor(state, rest),
         "cycle_monitor" => cmd_cycle_monitor(state, rest),
         "detect_monitors" => {
+            state.auto_monitors = true;
             state.monitors.list.clear();
             state.maybe_detect_monitors();
             state.request_manage();
@@ -220,6 +221,7 @@ fn cmd_set_monitors(state: &mut State, rest: &[String]) -> String {
         }
     }
     state.monitors.set_monitors(&rects);
+    state.auto_monitors = false; // explicit topology — don't auto-clobber on hotplug
     state.request_manage();
     ok()
 }

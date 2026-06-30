@@ -295,6 +295,9 @@ struct State {
     idle_clients: Vec<UnixStream>,
     /// User-defined attributes (hlwm `my_*`), created with `new_attr`.
     user_attrs: HashMap<String, String>,
+    /// True while the monitor topology is auto-derived from outputs (no explicit
+    /// `set_monitors`); lets output hotplug re-detect without clobbering a config.
+    auto_monitors: bool,
 }
 
 impl State {
@@ -324,13 +327,11 @@ impl State {
         self.monitors.focused().map(|m| m.tag).unwrap_or(1)
     }
 
-    /// If no monitors are configured yet but river has reported real outputs,
-    /// build one base monitor per output (hlwm `detect_monitors`). This is the
-    /// fallback when the `autostart` never calls `set_monitors`.
+    /// Build one base monitor per output (hlwm `detect_monitors`), the fallback
+    /// when the `autostart` never calls `set_monitors`. Rebuilds on output
+    /// hotplug *only* while the topology is still auto-derived — an explicit
+    /// `set_monitors` clears `auto_monitors` and is never clobbered.
     fn maybe_detect_monitors(&mut self) {
-        if !self.monitors.list.is_empty() {
-            return;
-        }
         let mut geos: Vec<OutputGeo> = self
             .outputs
             .values()
@@ -338,6 +339,12 @@ impl State {
             .filter(|g| g.w > 0 && g.h > 0)
             .collect();
         if geos.is_empty() {
+            return;
+        }
+        // Populate once when empty, or re-derive when the output count changes
+        // and we're still in auto mode (a monitor was plugged in/out).
+        let count_changed = self.auto_monitors && self.monitors.list.len() != geos.len();
+        if !self.monitors.list.is_empty() && !count_changed {
             return;
         }
         geos.sort_by_key(|g| (g.x, g.y));
@@ -1080,6 +1087,7 @@ fn main() {
         pending_op_end: Vec::new(),
         idle_clients: Vec::new(),
         user_attrs: HashMap::new(),
+        auto_monitors: true,
     };
 
     // --- calloop event loop: Wayland + the IPC socket on one thread ---
@@ -1286,6 +1294,7 @@ impl Dispatch<RiverOutputV1, ()> for State {
             Event::Removed => {
                 state.outputs.remove(&id);
                 out.destroy();
+                state.maybe_detect_monitors(); // hotplug: re-derive if auto
                 state.request_manage();
             }
             _ => {}
