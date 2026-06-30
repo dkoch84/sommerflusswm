@@ -303,6 +303,62 @@ impl Frame {
         }
     }
 
+    /// Paths to every leaf in depth-first (left-child-first) order.
+    fn leaf_paths(&self) -> Vec<Vec<usize>> {
+        let mut out = Vec::new();
+        self.collect_leaf_paths(&mut Vec::new(), &mut out);
+        out
+    }
+    fn collect_leaf_paths(&self, path: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+        match self {
+            Frame::Leaf(_) => out.push(path.clone()),
+            Frame::Split(s) => {
+                path.push(0);
+                s.children[0].collect_leaf_paths(path, out);
+                path.pop();
+                path.push(1);
+                s.children[1].collect_leaf_paths(path, out);
+                path.pop();
+            }
+        }
+    }
+
+    /// Total number of leaves (frames) in the tree.
+    pub fn leaves_total(&self) -> usize {
+        self.leaf_paths().len()
+    }
+
+    /// Depth-first index of the currently focused leaf.
+    pub fn focused_leaf_index(&self) -> usize {
+        let fp = self.focused_path();
+        self.leaf_paths().iter().position(|p| *p == fp).unwrap_or(0)
+    }
+
+    /// Focus the `n`-th leaf in depth-first order (hlwm-ish absolute frame focus,
+    /// used by loadstate to place windows). Returns false if out of range.
+    pub fn focus_nth_leaf(&mut self, n: usize) -> bool {
+        match self.leaf_paths().get(n) {
+            Some(p) => {
+                let p = p.clone();
+                self.set_focus_path(&p);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Cycle frame focus by `delta` in depth-first order, wrapping (hlwm
+    /// `cycle_frame`).
+    pub fn cycle_frame(&mut self, delta: i32) {
+        let total = self.leaves_total() as i32;
+        if total <= 1 {
+            return;
+        }
+        let cur = self.focused_leaf_index() as i32;
+        let next = ((cur + delta) % total + total) % total;
+        self.focus_nth_leaf(next as usize);
+    }
+
     /// Cycle the selection within the focused leaf by `delta`.
     pub fn cycle(&mut self, delta: i32) {
         let leaf = self.focused_leaf_mut();

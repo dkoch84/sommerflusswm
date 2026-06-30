@@ -103,6 +103,20 @@ pub(crate) fn dispatch(state: &mut State, args: &[String]) -> String {
         "remove" => cmd_remove(state),
         "cycle" => cmd_cycle(state, rest),
         "cycle_all" => cmd_cycle_all(state, rest),
+        "cycle_frame" => {
+            let d = rest.first().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1);
+            state.focused_tree_mut().cycle_frame(d);
+            state.request_manage();
+            ok()
+        }
+        "focus_frame" => match rest.first().and_then(|s| s.parse::<usize>().ok()) {
+            Some(n) => {
+                state.focused_tree_mut().focus_nth_leaf(n);
+                state.request_manage();
+                ok()
+            }
+            None => err("focus_frame: expected a frame index"),
+        },
         "set_layout" => cmd_set_layout(state, rest),
         "cycle_layout" => cmd_cycle_layout(state),
         "set" => cmd_set(state, rest),

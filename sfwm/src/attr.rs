@@ -12,6 +12,7 @@
 //! attribute delegates to the same code path as the `set` command.
 
 use crate::frame::{Frame, LayoutMode, WinId};
+use crate::monitor::Rect;
 use crate::State;
 
 fn color(c: (u8, u8, u8, u8)) -> String {
@@ -132,6 +133,10 @@ fn client_get(state: &State, wid: WinId, attr: &str) -> Result<String, String> {
         "pseudotile" => boolstr(w.pseudotile),
         "urgent" => boolstr(w.urgent),
         "focused" => boolstr(focused(state) == Some(wid)),
+        "floating_geometry" => {
+            let g = w.float_geo;
+            format!("{}x{}{:+}{:+}", g.w, g.h, g.x, g.y)
+        }
         _ => return Err(format!("clients.{wid}: no such attribute: {attr}")),
     })
 }
@@ -225,6 +230,14 @@ fn client_set(state: &mut State, wid: WinId, attr: &str, val: &str) -> Result<()
                 state.make_floating(wid, geo);
             } else if let Some(w) = state.windows.get_mut(&wid) {
                 w.floating = false;
+            }
+        }
+        "floating_geometry" => {
+            let g = Rect::parse(val).ok_or_else(|| format!("bad geometry '{val}' (want WxH+X+Y)"))?;
+            state.make_floating(wid, g);
+            if let Some(w) = state.windows.get_mut(&wid) {
+                w.floating = true;
+                w.float_geo = g;
             }
         }
         _ => return Err(format!("clients.{wid}: attribute not writable: {attr}")),
