@@ -136,6 +136,61 @@ pub(crate) fn dispatch(state: &mut State, args: &[String]) -> String {
             ok()
         }
         "version" => format!("sommerfluss {}\n", env!("CARGO_PKG_VERSION")),
+        // --- object/attribute tree ---
+        "attr" => crate::attr::list(state, rest.first().map(|s| s.as_str())),
+        "get_attr" => match rest.first() {
+            Some(p) => match crate::attr::get(state, p) {
+                Ok(v) => format!("{v}\n"),
+                Err(e) => err(&e),
+            },
+            None => err("get_attr: expected an attribute path"),
+        },
+        "set_attr" => {
+            if rest.len() < 2 {
+                err("set_attr: expected <path> <value>")
+            } else {
+                match crate::attr::set(state, &rest[0], &rest[1]) {
+                    Ok(()) => ok(),
+                    Err(e) => err(&e),
+                }
+            }
+        }
+        "new_attr" => {
+            if rest.len() < 2 {
+                err("new_attr: expected <type> <my_name>")
+            } else {
+                match crate::attr::new_attr(state, &rest[0], &rest[1]) {
+                    Ok(()) => ok(),
+                    Err(e) => err(&e),
+                }
+            }
+        }
+        "remove_attr" => match rest.first() {
+            Some(p) => match crate::attr::remove_attr(state, p) {
+                Ok(()) => ok(),
+                Err(e) => err(&e),
+            },
+            None => err("remove_attr: expected an attribute path"),
+        },
+        // --- command combinators ---
+        "chain" => cmd_chain(state, rest, ChainMode::Chain),
+        "and" => cmd_chain(state, rest, ChainMode::And),
+        "or" => cmd_chain(state, rest, ChainMode::Or),
+        "!" | "negate" => cmd_negate(state, rest),
+        "try" => {
+            let reply = dispatch(state, rest);
+            if reply.starts_with("error:") { ok() } else { reply }
+        }
+        "silent" => {
+            let reply = dispatch(state, rest);
+            if reply.starts_with("error:") { err("(silenced)") } else { String::new() }
+        }
+        "compare" => cmd_compare(state, rest),
+        "substitute" => cmd_substitute(state, rest),
+        "sprintf" => cmd_sprintf(state, rest),
+        "echo" => format!("{}\n", rest.join(" ")),
+        "true" => ok(),
+        "false" => err("false"),
         "dump" => cmd_dump_layout(state, rest),
         "load" => cmd_load(state, rest),
         "dump_tree" => cmd_dump_tree(state),
@@ -1079,6 +1134,156 @@ fn list_rules(state: &State) -> String {
     out
 }
 
+// --- command combinators -------------------------------------------------------
+
+enum ChainMode {
+    Chain,
+    And,
+    Or,
+}
+
+fn failed(reply: &str) -> bool {
+    reply.starts_with("error:")
+}
+
+/// Split `args` into groups on the separator token `sep`.
+fn split_groups(args: &[String], sep: &str) -> Vec<Vec<String>> {
+    let mut groups = Vec::new();
+    let mut cur = Vec::new();
+    for a in args {
+        if a == sep {
+            groups.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(a.clone());
+        }
+    }
+    groups.push(cur);
+    groups
+}
+
+/// `chain`/`and`/`or <SEP> cmd1 <SEP> cmd2 …`. Chain runs all and concatenates
+/// output; `and` stops at the first failure; `or` stops at the first success.
+fn cmd_chain(state: &mut State, rest: &[String], mode: ChainMode) -> String {
+    let Some(sep) = rest.first() else {
+        return err("chain: expected a separator token");
+    };
+    let groups = split_groups(&rest[1..], sep);
+    let mut acc = String::new();
+    let mut last = ok();
+    for g in groups {
+        if g.is_empty() {
+            continue;
+        }
+        let reply = dispatch(state, &g);
+        match mode {
+            ChainMode::Chain => acc.push_str(&reply),
+            ChainMode::And => {
+                last = reply.clone();
+                if failed(&reply) {
+                    return reply;
+                }
+            }
+            ChainMode::Or => {
+                if !failed(&reply) {
+                    return reply;
+                }
+                last = reply;
+            }
+        }
+    }
+    match mode {
+        ChainMode::Chain => acc,
+        _ => last,
+    }
+}
+
+/// `! cmd…` / `negate cmd…` — invert a command's success status.
+fn cmd_negate(state: &mut State, rest: &[String]) -> String {
+    if rest.is_empty() {
+        return err("negate: expected a command");
+    }
+    let reply = dispatch(state, rest);
+    if failed(&reply) {
+        ok()
+    } else {
+        err("negate: command succeeded")
+    }
+}
+
+/// `compare <path> <op> <value>` — succeed iff the comparison holds. Numeric if
+/// both sides parse as integers, else lexicographic. Ops: = != lt le gt ge.
+fn cmd_compare(state: &mut State, rest: &[String]) -> String {
+    if rest.len() < 3 {
+        return err("compare: expected <path> <op> <value>");
+    }
+    let lhs = match crate::attr::get(state, &rest[0]) {
+        Ok(v) => v,
+        Err(e) => return err(&e),
+    };
+    let (op, rhs) = (rest[1].as_str(), rest[2].as_str());
+    let ord = match (lhs.parse::<i64>(), rhs.parse::<i64>()) {
+        (Ok(a), Ok(b)) => a.cmp(&b),
+        _ => lhs.as_str().cmp(rhs),
+    };
+    use std::cmp::Ordering::*;
+    let truth = match op {
+        "=" | "==" => ord == Equal,
+        "!=" => ord != Equal,
+        "lt" => ord == Less,
+        "le" => ord != Greater,
+        "gt" => ord == Greater,
+        "ge" => ord != Less,
+        _ => return err(&format!("compare: unknown operator '{op}'")),
+    };
+    if truth {
+        ok()
+    } else {
+        err("compare: false")
+    }
+}
+
+/// `substitute IDENT ATTR CMD…` — replace whole-token occurrences of IDENT in
+/// the command with the value of attribute ATTR, then run it.
+fn cmd_substitute(state: &mut State, rest: &[String]) -> String {
+    if rest.len() < 3 {
+        return err("substitute: expected <ident> <attr> <command...>");
+    }
+    let ident = rest[0].clone();
+    let val = match crate::attr::get(state, &rest[1]) {
+        Ok(v) => v,
+        Err(e) => return err(&e),
+    };
+    let cmd: Vec<String> = rest[2..]
+        .iter()
+        .map(|a| if *a == ident { val.clone() } else { a.clone() })
+        .collect();
+    dispatch(state, &cmd)
+}
+
+/// `sprintf IDENT FORMAT [ATTR…] CMD…` — build a string from FORMAT (only `%s`
+/// supported), consuming one attribute per `%s`, bind it to IDENT, then run CMD.
+fn cmd_sprintf(state: &mut State, rest: &[String]) -> String {
+    if rest.len() < 2 {
+        return err("sprintf: expected <ident> <format> [attrs...] <command...>");
+    }
+    let ident = rest[0].clone();
+    let fmt = rest[1].clone();
+    let n = fmt.matches("%s").count();
+    if rest.len() < 2 + n + 1 {
+        return err("sprintf: not enough arguments for the format");
+    }
+    let mut result = fmt;
+    for i in 0..n {
+        let v = crate::attr::get(state, &rest[2 + i]).unwrap_or_else(|_| rest[2 + i].clone());
+        result = result.replacen("%s", &v, 1);
+    }
+    let cmd: Vec<String> = rest[2 + n..]
+        .iter()
+        .map(|a| if *a == ident { result.clone() } else { a.clone() })
+        .collect();
+    dispatch(state, &cmd)
+}
+
 // --- helpers -------------------------------------------------------------------
 
 fn parse_tag(s: &str) -> Option<TagId> {
@@ -1099,7 +1304,19 @@ fn err(msg: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_binding;
+    use super::{parse_binding, split_groups};
+
+    #[test]
+    fn chain_splits_on_separator() {
+        let args: Vec<String> = ["use", "2", ",", "spawn", "alacritty"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let g = split_groups(&args, ",");
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0], vec!["use", "2"]);
+        assert_eq!(g[1], vec!["spawn", "alacritty"]);
+    }
 
     // xkbcommon keysyms: ASCII letters/digits map to their code points; named
     // keys use the X keysym values.

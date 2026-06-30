@@ -13,6 +13,7 @@
 //!   2. sfwm's `autostart` — a shell script calling `sc` (set_monitors, add_monitor,
 //!      raise_monitor, lock_tag, pad, …), a near-direct port of the hlwm autostart.
 
+mod attr;
 mod frame;
 mod ipc;
 mod monitor;
@@ -292,6 +293,8 @@ struct State {
     pending_op_end: Vec<RiverSeatV1>,
     /// Connected `sc --idle` clients receiving the hook stream (hlwm `--idle`).
     idle_clients: Vec<UnixStream>,
+    /// User-defined attributes (hlwm `my_*`), created with `new_attr`.
+    user_attrs: HashMap<String, String>,
 }
 
 impl State {
@@ -1076,6 +1079,7 @@ fn main() {
         pending_op_start: Vec::new(),
         pending_op_end: Vec::new(),
         idle_clients: Vec::new(),
+        user_attrs: HashMap::new(),
     };
 
     // --- calloop event loop: Wayland + the IPC socket on one thread ---
