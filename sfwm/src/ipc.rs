@@ -574,7 +574,7 @@ fn cmd_set(state: &mut State, rest: &[String]) -> String {
         return err("set: expected <name> <value>");
     };
     match name {
-        "window_gap" => match v.parse::<i32>() {
+        "window_gap" | "frame_gap" => match v.parse::<i32>() {
             Ok(n) => state.window_gap = n.max(0),
             Err(_) => return err("set window_gap: expected an integer"),
         },
@@ -595,6 +595,13 @@ fn cmd_set(state: &mut State, rest: &[String]) -> String {
             None => return err("set: bad colour (use #rrggbb)"),
         },
         "focus_follows_mouse" => state.focus_follows_mouse = parse_bool(v),
+        "raise_on_focus" => state.raise_on_focus = parse_bool(v),
+        "smart_frame_surroundings" => state.smart_frame_surroundings = parse_bool(v),
+        "smart_window_surroundings" => state.smart_window_surroundings = parse_bool(v),
+        "default_frame_layout" => match frame::LayoutMode::parse(v) {
+            Some(l) => state.default_frame_layout = l,
+            None => return err("set default_frame_layout: expected max|vertical|horizontal|grid"),
+        },
         // Unknown settings are accepted-and-ignored so autostart ports don't fail.
         _ => return ok(),
     }

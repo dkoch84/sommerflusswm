@@ -161,12 +161,27 @@ impl Frame {
         Frame::Leaf(Leaf::empty())
     }
 
+    /// A fresh tree whose single leaf adopts `layout` (hlwm `default_frame_layout`).
+    pub fn with_layout(layout: LayoutMode) -> Frame {
+        Frame::Leaf(Leaf {
+            windows: Vec::new(),
+            selected: 0,
+            layout,
+        })
+    }
+
     #[allow(dead_code)] // used by tests; a primitive for empty-frame pruning later
     pub fn is_empty(&self) -> bool {
         match self {
             Frame::Leaf(l) => l.windows.is_empty(),
             Frame::Split(_) => false,
         }
+    }
+
+    /// True when the whole tree is a single leaf (no splits) — used by
+    /// `smart_frame_surroundings` to drop the gap around a lone frame.
+    pub fn is_single_leaf(&self) -> bool {
+        matches!(self, Frame::Leaf(_))
     }
 
     // --- focus -----------------------------------------------------------------

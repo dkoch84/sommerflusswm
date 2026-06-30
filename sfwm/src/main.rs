@@ -255,6 +255,14 @@ struct State {
     // --- behaviour settings ---
     /// hlwm `focus_follows_mouse`: pointer entering a window focuses it.
     focus_follows_mouse: bool,
+    /// hlwm `raise_on_focus`: focusing a floating window raises it to the top.
+    raise_on_focus: bool,
+    /// hlwm `smart_frame_surroundings`: drop the gap around a lone frame.
+    smart_frame_surroundings: bool,
+    /// hlwm `smart_window_surroundings`: drop the border for a lone tiled window.
+    smart_window_surroundings: bool,
+    /// Layout a freshly-created (empty) tag tree adopts (`default_frame_layout`).
+    default_frame_layout: frame::LayoutMode,
     /// Next float stacking key to hand out (see `Window::raise_seq`).
     next_raise: u64,
 
@@ -338,9 +346,11 @@ impl State {
             .unwrap_or(Rect::new(0, 0, 0, 0))
     }
 
-    /// The frame tree for a tag, creating an empty one on first use.
+    /// The frame tree for a tag, creating an empty one (using the configured
+    /// `default_frame_layout`) on first use.
     fn tag_tree_mut(&mut self, tag: TagId) -> &mut Frame {
-        self.tags.entry(tag).or_default()
+        let default = self.default_frame_layout;
+        self.tags.entry(tag).or_insert_with(|| Frame::with_layout(default))
     }
 
     /// The focused monitor's frame tree.
@@ -368,7 +378,13 @@ impl State {
             // Tiled windows from the frame tree (floating ones are skipped here
             // and rendered separately below, above the tiling).
             if let Some(tree) = self.tags.get(&tag) {
-                for p in tree.placements(usable, self.window_gap) {
+                // smart_frame_surroundings: a lone frame gets no surrounding gap.
+                let gap = if self.smart_frame_surroundings && tree.is_single_leaf() {
+                    0
+                } else {
+                    self.window_gap
+                };
+                for p in tree.placements(usable, gap) {
                     if self.windows.get(&p.win).map_or(false, |w| w.floating) {
                         continue;
                     }
@@ -449,6 +465,14 @@ impl State {
         }
         if let Some(w) = self.windows.get_mut(&wid) {
             w.urgent = false; // focusing a window clears its urgency
+        }
+        // hlwm raise_on_focus: lift a focused floating window above the others.
+        if self.raise_on_focus && self.windows.get(&wid).map_or(false, |w| w.floating) {
+            let seq = self.next_raise;
+            self.next_raise += 1;
+            if let Some(w) = self.windows.get_mut(&wid) {
+                w.raise_seq = seq;
+            }
         }
     }
 
@@ -788,6 +812,17 @@ impl State {
             self.last_rects.insert(i.win, i.rect);
         }
 
+        // smart_window_surroundings: count tiled+visible windows per monitor so a
+        // lone tiled window can be drawn with no border.
+        let mut tiled_per_mon: HashMap<usize, usize> = HashMap::new();
+        if self.smart_window_surroundings {
+            for i in &layout {
+                if i.visible && i.layer == Layer::Tiled {
+                    *tiled_per_mon.entry(i.mon).or_insert(0) += 1;
+                }
+            }
+        }
+
         let bw = self.border_width;
         let active = expand_color(self.border_active);
         let normal = expand_color(self.border_normal);
@@ -824,7 +859,9 @@ impl State {
 
             let w = self.windows.get(&item.win).unwrap();
             w.win.show();
-            if bw > 0 && item.layer != Layer::Fullscreen {
+            let lone = item.layer == Layer::Tiled
+                && tiled_per_mon.get(&item.mon).copied() == Some(1);
+            if bw > 0 && item.layer != Layer::Fullscreen && !lone {
                 let c = if Some(item.win) == focused {
                     active
                 } else if w.urgent {
@@ -975,6 +1012,10 @@ fn main() {
         border_normal: (0x1d, 0x25, 0x2b, 0xff),
         border_urgent: (0xff, 0x6c, 0x6b, 0xff),
         focus_follows_mouse: false,
+        raise_on_focus: false,
+        smart_frame_surroundings: false,
+        smart_window_surroundings: false,
+        default_frame_layout: frame::LayoutMode::Vertical,
         next_raise: 1,
         rules: Vec::new(),
         tag_monitor: HashMap::new(),
