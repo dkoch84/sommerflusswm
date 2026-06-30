@@ -83,8 +83,13 @@ struct Window {
     floating: bool,
     /// Geometry used while floating (absolute logical coords).
     float_geo: Rect,
+    /// Monotonic float stacking key: higher renders above other floats (hlwm
+    /// `raise`/`lower`). Gives floating windows a deterministic order.
+    raise_seq: u64,
     /// Whether window rules have been applied (once, when app_id/title first known).
     rules_applied: bool,
+    /// Window requested attention (xdg-activation / urgency) and isn't focused.
+    urgent: bool,
 }
 
 impl Window {
@@ -101,7 +106,9 @@ impl Window {
             pseudotile: false,
             floating: false,
             float_geo: Rect::new(0, 0, 0, 0),
+            raise_seq: 0,
             rules_applied: false,
+            urgent: false,
         }
     }
 }
@@ -122,6 +129,29 @@ struct Rule {
     tag: Option<TagId>,
     floating: Option<bool>,
     pseudotile: Option<bool>,
+}
+
+impl Rule {
+    /// A one-line `key=value` rendering for `list_rules`.
+    fn describe(&self) -> String {
+        let mut p = Vec::new();
+        if let Some((exact, v)) = &self.app_id {
+            p.push(format!("app_id{}{v}", if *exact { "=" } else { "~" }));
+        }
+        if let Some((exact, v)) = &self.title {
+            p.push(format!("title{}{v}", if *exact { "=" } else { "~" }));
+        }
+        if let Some(t) = self.tag {
+            p.push(format!("tag={t}"));
+        }
+        if let Some(f) = self.floating {
+            p.push(format!("floating={}", if f { "on" } else { "off" }));
+        }
+        if let Some(ps) = self.pseudotile {
+            p.push(format!("pseudotile={}", if ps { "on" } else { "off" }));
+        }
+        p.join(" ")
+    }
 }
 
 /// An interactive pointer operation in progress (move or resize a floating window).
@@ -147,10 +177,14 @@ struct RenderItem {
     /// False for windows obscured within a `max` leaf — they get hidden.
     visible: bool,
     layer: Layer,
+    /// Within-layer stacking key (float `raise_seq`; 0 for tiled).
+    seq: u64,
 }
 
 /// A keyboard binding: the river binding object plus the `sc` command it runs.
 struct KeyBind {
+    /// The original spec ("Mod4+Return") for `list_keybinds`.
+    spec: String,
     binding: RiverXkbBindingV1,
     command: Vec<String>,
 }
@@ -190,6 +224,13 @@ struct State {
     border_width: i32,
     border_active: (u8, u8, u8, u8),
     border_normal: (u8, u8, u8, u8),
+    border_urgent: (u8, u8, u8, u8),
+
+    // --- behaviour settings ---
+    /// hlwm `focus_follows_mouse`: pointer entering a window focuses it.
+    focus_follows_mouse: bool,
+    /// Next float stacking key to hand out (see `Window::raise_seq`).
+    next_raise: u64,
 
     // --- rules & tag affinity ---
     rules: Vec<Rule>,
@@ -305,6 +346,7 @@ impl State {
                         rect: p.rect,
                         visible: p.visible,
                         layer: if fs { Layer::Fullscreen } else { Layer::Tiled },
+                        seq: 0,
                     });
                 }
             }
@@ -320,17 +362,19 @@ impl State {
                     rect: w.float_geo,
                     visible: true,
                     layer: if w.fullscreen { Layer::Fullscreen } else { Layer::Floating },
+                    seq: w.raise_seq,
                 });
             }
 
             per_mon.insert(mi, items);
         }
 
-        // Emit bottom → top; within a monitor, low layer first.
+        // Emit bottom → top; within a monitor, low layer first, then by the
+        // float stacking key (so `raise`/`lower` and insertion order are stable).
         let mut out = Vec::new();
         for mi in order {
             if let Some(mut items) = per_mon.remove(&mi) {
-                items.sort_by_key(|i| i.layer);
+                items.sort_by_key(|i| (i.layer, i.seq));
                 out.append(&mut items);
             }
         }
@@ -366,6 +410,9 @@ impl State {
         }
         if let Some(mi) = self.monitors.list.iter().position(|m| m.tag == tag) {
             self.monitors.focus = mi;
+        }
+        if let Some(w) = self.windows.get_mut(&wid) {
+            w.urgent = false; // focusing a window clears its urgency
         }
     }
 
@@ -454,7 +501,7 @@ impl State {
 
     /// Register a key binding (hlwm `keybind`). Creates the river binding object
     /// now and queues it for `enable()` in the next manage sequence.
-    fn add_keybind(&mut self, mods_bits: u32, keysym: u32, command: Vec<String>) -> Result<(), String> {
+    fn add_keybind(&mut self, spec: String, mods_bits: u32, keysym: u32, command: Vec<String>) -> Result<(), String> {
         let binding = {
             let mgr = self
                 .xkb_bindings
@@ -467,6 +514,7 @@ impl State {
         self.keybinds.insert(
             binding.id(),
             KeyBind {
+                spec,
                 binding: binding.clone(),
                 command,
             },
@@ -514,12 +562,32 @@ impl State {
     /// tree (so it remains focusable / navigable); the tiling pass simply skips
     /// floating windows and they render above the tiles at `float_geo`.
     fn make_floating(&mut self, wid: WinId, geo: Rect) {
+        let seq = self.next_raise;
         if let Some(w) = self.windows.get_mut(&wid) {
             if !w.floating {
                 w.floating = true;
                 w.float_geo = geo;
+                w.raise_seq = seq;
+                self.next_raise += 1;
             }
         }
+    }
+
+    /// Raise (`to_top` true) or lower the focused window in the float stack.
+    fn restack_focused(&mut self, to_top: bool) {
+        let Some(wid) = self.focused_window() else { return };
+        let seq = if to_top {
+            let s = self.next_raise;
+            self.next_raise += 1;
+            s
+        } else {
+            // Below every current float.
+            self.windows.values().map(|w| w.raise_seq).min().unwrap_or(1).saturating_sub(1)
+        };
+        if let Some(w) = self.windows.get_mut(&wid) {
+            w.raise_seq = seq;
+        }
+        self.request_manage();
     }
 
     /// The manage pass: window-management state only (propose_dimensions,
@@ -654,6 +722,7 @@ impl State {
         let bw = self.border_width;
         let active = expand_color(self.border_active);
         let normal = expand_color(self.border_normal);
+        let urgent = expand_color(self.border_urgent);
 
         let mut ordered_nodes: Vec<RiverNodeV1> = Vec::with_capacity(layout.len());
         for item in &layout {
@@ -687,7 +756,13 @@ impl State {
             let w = self.windows.get(&item.win).unwrap();
             w.win.show();
             if bw > 0 && item.layer != Layer::Fullscreen {
-                let c = if Some(item.win) == focused { active } else { normal };
+                let c = if Some(item.win) == focused {
+                    active
+                } else if w.urgent {
+                    urgent
+                } else {
+                    normal
+                };
                 w.win.set_borders(all_edges(), bw, c.0, c.1, c.2, c.3);
             } else {
                 w.win.set_borders(river_window_v1::Edges::empty(), 0, 0, 0, 0, 0);
@@ -829,6 +904,9 @@ fn main() {
         border_width: 0,
         border_active: (0x4e, 0x9b, 0xcf, 0xff),
         border_normal: (0x1d, 0x25, 0x2b, 0xff),
+        border_urgent: (0xff, 0x6c, 0x6b, 0xff),
+        focus_follows_mouse: false,
+        next_raise: 1,
         rules: Vec::new(),
         tag_monitor: HashMap::new(),
         pointer_binds: HashMap::new(),
@@ -1061,7 +1139,14 @@ impl Dispatch<RiverSeatV1, ()> for State {
         use river_seat_v1::Event;
         match event {
             Event::PointerEnter { window } => {
-                state.pointer_focus = state.win_by_obj.get(&window.id()).copied();
+                let wid = state.win_by_obj.get(&window.id()).copied();
+                state.pointer_focus = wid;
+                if state.focus_follows_mouse {
+                    if let Some(wid) = wid {
+                        state.focus_window_by_id(wid);
+                        state.request_manage();
+                    }
+                }
             }
             Event::PointerLeave => {
                 state.pointer_focus = None;

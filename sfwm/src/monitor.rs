@@ -301,6 +301,58 @@ impl Monitors {
         }
     }
 
+    /// Remove a monitor (hlwm `remove_monitor`). Keeps `focus` in range.
+    pub fn remove_monitor(&mut self, sel: &MonitorSel) -> bool {
+        match self.resolve(sel) {
+            Some(i) => {
+                self.list.remove(i);
+                if self.focus >= self.list.len() {
+                    self.focus = self.list.len().saturating_sub(1);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Clear a monitor's tag lock (hlwm `unlock_tag`).
+    pub fn unlock_tag(&mut self, sel: &MonitorSel) -> bool {
+        match self.resolve(sel) {
+            Some(i) => {
+                self.list[i].locked_tag = None;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Reposition/resize a monitor's rect (hlwm `move_monitor`).
+    pub fn move_monitor(&mut self, sel: &MonitorSel, rect: Rect) -> bool {
+        match self.resolve(sel) {
+            Some(i) => {
+                self.list[i].rect = rect;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Rename a monitor (hlwm `rename_monitor`). `None` clears the name.
+    pub fn rename_monitor(&mut self, sel: &MonitorSel, name: Option<String>) -> bool {
+        match self.resolve(sel) {
+            Some(i) => {
+                self.list[i].name = name;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The tag currently displayed on the selected monitor.
+    pub fn tag_of(&self, sel: &MonitorSel) -> Option<TagId> {
+        self.resolve(sel).map(|i| self.list[i].tag)
+    }
+
     /// Indices of monitors in render order: ascending `z`, ties broken by list
     /// index (stable). The first entry renders at the bottom, the last on top —
     /// so overlays (high `z`) end up above the base monitors they overlap.
@@ -416,5 +468,18 @@ mod tests {
         assert_eq!(m.visible_tags(), vec![1]);
         assert!(m.tag_visible(1));
         assert!(!m.tag_visible(5));
+    }
+
+    #[test]
+    fn remove_monitor_keeps_focus_in_range() {
+        let mut m = Monitors::new();
+        m.set_monitors(&[Rect::new(0, 0, 1, 1), Rect::new(1, 0, 1, 1), Rect::new(2, 0, 1, 1)]);
+        m.focus = 2;
+        assert!(m.remove_monitor(&MonitorSel::Index(2)));
+        assert_eq!(m.list.len(), 2);
+        assert_eq!(m.focus, 1); // clamped back into range
+        assert!(m.rename_monitor(&MonitorSel::Index(0), Some("primary".into())));
+        assert_eq!(m.tag_of(&MonitorSel::Name("primary".into())), Some(1));
+        assert!(!m.remove_monitor(&MonitorSel::Index(9)));
     }
 }

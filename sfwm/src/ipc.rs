@@ -63,9 +63,24 @@ pub(crate) fn dispatch(state: &mut State, args: &[String]) -> String {
             state.request_manage();
             ok()
         }
+        "remove_monitor" => cmd_remove_monitor(state, rest),
+        "unlock_tag" => cmd_unlock_tag(state, rest),
+        "move_monitor" => cmd_move_monitor(state, rest),
+        "rename_monitor" => cmd_rename_monitor(state, rest),
+        "shift_to_monitor" => cmd_shift_to_monitor(state, rest),
         "use" => cmd_use(state, rest),
         "use_index" => cmd_use_index(state, rest),
         "move" => cmd_move(state, rest),
+        "bring" => cmd_bring(state, rest),
+        "jumpto" => cmd_jumpto(state, rest),
+        "raise" => {
+            state.restack_focused(true);
+            ok()
+        }
+        "lower" => {
+            state.restack_focused(false);
+            ok()
+        }
         "spawn" => cmd_spawn(rest),
         "keybind" => cmd_keybind(state, rest),
         "keyunbind" => cmd_keyunbind(state, rest),
@@ -82,6 +97,13 @@ pub(crate) fn dispatch(state: &mut State, args: &[String]) -> String {
         "set" => cmd_set(state, rest),
         // per-window modes
         "close" => cmd_close(state),
+        "close_or_remove" => {
+            if state.focused_window().is_some() {
+                cmd_close(state)
+            } else {
+                cmd_remove(state)
+            }
+        }
         "fullscreen" => cmd_window_mode(state, rest, WinMode::Fullscreen),
         "pseudotile" => cmd_window_mode(state, rest, WinMode::Pseudotile),
         "floating" => cmd_floating(state, rest),
@@ -95,6 +117,9 @@ pub(crate) fn dispatch(state: &mut State, args: &[String]) -> String {
         "list_monitors" => list_monitors(state),
         "list_clients" => list_clients(state),
         "list_outputs" => list_outputs(state),
+        "list_keybinds" => list_keybinds(state),
+        "list_rules" => list_rules(state),
+        "version" => format!("sommerfluss {}\n", env!("CARGO_PKG_VERSION")),
         "dump" => cmd_dump(state),
         "quit" => {
             std::process::exit(0);
@@ -216,6 +241,69 @@ fn cmd_cycle_monitor(state: &mut State, rest: &[String]) -> String {
     ok()
 }
 
+fn cmd_remove_monitor(state: &mut State, rest: &[String]) -> String {
+    let Some(sel) = rest.first() else {
+        return err("remove_monitor: expected a monitor selector");
+    };
+    if state.monitors.remove_monitor(&MonitorSel::parse(sel)) {
+        state.request_manage();
+        ok()
+    } else {
+        err(&format!("remove_monitor: no such monitor '{sel}'"))
+    }
+}
+
+fn cmd_unlock_tag(state: &mut State, rest: &[String]) -> String {
+    let Some(sel) = rest.first() else {
+        return err("unlock_tag: expected a monitor selector");
+    };
+    if state.monitors.unlock_tag(&MonitorSel::parse(sel)) {
+        state.request_manage();
+        ok()
+    } else {
+        err(&format!("unlock_tag: no such monitor '{sel}'"))
+    }
+}
+
+fn cmd_move_monitor(state: &mut State, rest: &[String]) -> String {
+    if rest.len() < 2 {
+        return err("move_monitor: expected <monitor> <rect>");
+    }
+    let Some(rect) = Rect::parse(&rest[1]) else {
+        return err(&format!("move_monitor: bad rect '{}'", rest[1]));
+    };
+    if state.monitors.move_monitor(&MonitorSel::parse(&rest[0]), rect) {
+        state.request_manage();
+        ok()
+    } else {
+        err(&format!("move_monitor: no such monitor '{}'", rest[0]))
+    }
+}
+
+fn cmd_rename_monitor(state: &mut State, rest: &[String]) -> String {
+    if rest.len() < 2 {
+        return err("rename_monitor: expected <monitor> <name>");
+    }
+    let name = if rest[1].is_empty() { None } else { Some(rest[1].clone()) };
+    if state.monitors.rename_monitor(&MonitorSel::parse(&rest[0]), name) {
+        ok()
+    } else {
+        err(&format!("rename_monitor: no such monitor '{}'", rest[0]))
+    }
+}
+
+/// `shift_to_monitor <monitor>` — move the focused window to the tag currently
+/// shown on that monitor.
+fn cmd_shift_to_monitor(state: &mut State, rest: &[String]) -> String {
+    let Some(sel) = rest.first() else {
+        return err("shift_to_monitor: expected a monitor selector");
+    };
+    let Some(tag) = state.monitors.tag_of(&MonitorSel::parse(sel)) else {
+        return err(&format!("shift_to_monitor: no such monitor '{sel}'"));
+    };
+    move_focused_to_tag(state, tag)
+}
+
 // --- tag / window commands -----------------------------------------------------
 
 fn cmd_use(state: &mut State, rest: &[String]) -> String {
@@ -285,7 +373,11 @@ fn cmd_move(state: &mut State, rest: &[String]) -> String {
     let Some(tag) = rest.first().and_then(|s| parse_tag(s)) else {
         return err("move: expected a tag");
     };
-    // Move the focused window from its tag's tree into the target tag's tree.
+    move_focused_to_tag(state, tag)
+}
+
+/// Move the focused window from its current tag's tree into `tag`'s tree.
+fn move_focused_to_tag(state: &mut State, tag: TagId) -> String {
     let Some(wid) = state.focused_window() else {
         return err("move: no focused window");
     };
@@ -303,6 +395,44 @@ fn cmd_move(state: &mut State, rest: &[String]) -> String {
         w.tag = tag;
     }
     state.tag_tree_mut(tag).insert_window(wid);
+    state.request_manage();
+    ok()
+}
+
+/// `bring <winid>` — pull a window (by its `win=` id from `list_clients`) onto
+/// the focused tag's focused frame.
+fn cmd_bring(state: &mut State, rest: &[String]) -> String {
+    let Some(wid) = rest.first().and_then(|s| s.parse::<frame::WinId>().ok()) else {
+        return err("bring: expected a window id");
+    };
+    let Some(from) = state.windows.get(&wid).map(|w| w.tag) else {
+        return err(&format!("bring: no such window {wid}"));
+    };
+    let to = state.focused_tag();
+    if from != to {
+        if let Some(tree) = state.tags.get_mut(&from) {
+            tree.remove_window(wid);
+        }
+        if let Some(w) = state.windows.get_mut(&wid) {
+            w.tag = to;
+        }
+        state.focused_tree_mut().insert_window(wid);
+    } else {
+        state.focused_tree_mut().focus_window(wid);
+    }
+    state.request_manage();
+    ok()
+}
+
+/// `jumpto <winid>` — focus a window by its `win=` id (and the monitor showing it).
+fn cmd_jumpto(state: &mut State, rest: &[String]) -> String {
+    let Some(wid) = rest.first().and_then(|s| s.parse::<frame::WinId>().ok()) else {
+        return err("jumpto: expected a window id");
+    };
+    if !state.windows.contains_key(&wid) {
+        return err(&format!("jumpto: no such window {wid}"));
+    }
+    state.focus_window_by_id(wid);
     state.request_manage();
     ok()
 }
@@ -421,6 +551,11 @@ fn cmd_set(state: &mut State, rest: &[String]) -> String {
             Some(c) => state.border_normal = c,
             None => return err("set: bad colour (use #rrggbb)"),
         },
+        "border_color_urgent" => match parse_color(v) {
+            Some(c) => state.border_urgent = c,
+            None => return err("set: bad colour (use #rrggbb)"),
+        },
+        "focus_follows_mouse" => state.focus_follows_mouse = parse_bool(v),
         // Unknown settings are accepted-and-ignored so autostart ports don't fail.
         _ => return ok(),
     }
@@ -616,7 +751,7 @@ fn cmd_keybind(state: &mut State, rest: &[String]) -> String {
         Ok(v) => v,
         Err(e) => return err(&format!("keybind: {e}")),
     };
-    match state.add_keybind(mods, keysym, rest[1..].to_vec()) {
+    match state.add_keybind(rest[0].clone(), mods, keysym, rest[1..].to_vec()) {
         Ok(()) => ok(),
         Err(e) => err(&format!("keybind: {e}")),
     }
@@ -777,10 +912,40 @@ fn list_outputs(state: &State) -> String {
     out
 }
 
+fn list_keybinds(state: &State) -> String {
+    let mut lines: Vec<String> = state
+        .keybinds
+        .values()
+        .map(|kb| format!("{}\t{}\n", kb.spec, kb.command.join(" ")))
+        .collect();
+    lines.sort();
+    let out: String = lines.into_iter().collect();
+    if out.is_empty() {
+        "(no keybinds)\n".to_string()
+    } else {
+        out
+    }
+}
+
+fn list_rules(state: &State) -> String {
+    let mut out = String::new();
+    for (i, r) in state.rules.iter().enumerate() {
+        out.push_str(&format!("{i}:{}\n", r.describe()));
+    }
+    if out.is_empty() {
+        out.push_str("(no rules)\n");
+    }
+    out
+}
+
 // --- helpers -------------------------------------------------------------------
 
 fn parse_tag(s: &str) -> Option<TagId> {
     s.parse::<TagId>().ok()
+}
+
+fn parse_bool(s: &str) -> bool {
+    matches!(s, "on" | "true" | "1")
 }
 
 fn ok() -> String {
