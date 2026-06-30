@@ -1002,8 +1002,12 @@ impl State {
         };
         let dim = self.inactive_dim;
 
-        // Lazily (re)create the shared dim buffer at the current alpha.
-        if dim > 0.0 && self.dim_buffer.is_none() {
+        // Lazily (re)create the shared dim buffer at the current alpha. When it
+        // was just rebuilt (e.g. the alpha changed), force every shown overlay to
+        // re-attach the new buffer — otherwise an unchanged-size overlay keeps
+        // displaying the old one and the new dim level appears to do nothing.
+        let rebuilt = dim > 0.0 && self.dim_buffer.is_none();
+        if rebuilt {
             let a = (dim.clamp(0.0, 1.0) * u32::MAX as f64) as u32; // premultiplied black
             self.dim_buffer = Some(spb.create_u32_rgba_buffer(0, 0, 0, a, qh, ()));
         }
@@ -1039,7 +1043,7 @@ impl State {
                         }
                     }
                     if let Some(o) = self.windows.get_mut(&wid).and_then(|w| w.dim.as_mut()) {
-                        if !o.shown || o.size != (rect.w, rect.h) {
+                        if !o.shown || o.size != (rect.w, rect.h) || rebuilt {
                             o.surface.attach(Some(&buffer), 0, 0);
                             o.viewport.set_destination(rect.w.max(1), rect.h.max(1));
                             o.surface.damage(0, 0, i32::MAX, i32::MAX);
