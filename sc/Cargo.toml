@@ -2,7 +2,7 @@
 name = "sc"
 version = "0.1.0"
 edition = "2021"
-description = "sommerfluss control client — the herbstclient successor for sfwm"
+description = "sommerflusswm control client — the herbstclient successor for sfwm"
 
 [[bin]]
 name = "sc"

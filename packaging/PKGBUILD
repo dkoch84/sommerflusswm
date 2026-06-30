@@ -1,5 +1,5 @@
-# Maintainer: the sommerfluss authors
-pkgname=sommerfluss
+# Maintainer: the sommerflusswm authors
+pkgname=sommerflusswm
 pkgver=0.1.0
 pkgrel=7
 pkgdesc="herbstluftwm successor on river: sfwm window manager + sc control client (monitors, keybinds, frame tree, fullscreen/float/mouse/rules/borders)"
@@ -41,9 +41,9 @@ package() {
     install -Dm755 target/release/sfwm "$pkgdir/usr/bin/sfwm"
     install -Dm755 target/release/sc   "$pkgdir/usr/bin/sc"
 
-    # Example config: river's init and the sommerfluss autostart (calls sc).
-    install -Dm755 sfwm/examples/autostart  "$pkgdir/usr/share/sommerfluss/autostart"
-    install -Dm755 sfwm/examples/river-init  "$pkgdir/usr/share/sommerfluss/river-init"
+    # Example config: river's init and the sommerflusswm autostart (calls sc).
+    install -Dm755 sfwm/examples/autostart  "$pkgdir/usr/share/sommerflusswm/autostart"
+    install -Dm755 sfwm/examples/river-init  "$pkgdir/usr/share/sommerflusswm/river-init"
 
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"

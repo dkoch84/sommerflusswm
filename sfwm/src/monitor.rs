@@ -1,4 +1,4 @@
-//! The monitor model — sommerfluss's port of herbstluftwm's virtual monitors.
+//! The monitor model — sommerflusswm's port of herbstluftwm's virtual monitors.
 //!
 //! A `Monitor` is a WM-side abstraction, fully decoupled from `river_output_v1`:
 //! an arbitrary rectangle in the global logical coordinate space, with a stacking

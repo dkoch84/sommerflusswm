@@ -1,11 +1,11 @@
-# sommerfluss
+# sommerflusswm
 
 A manual, frame-tree tiling **window manager** for [river](https://codeberg.org/river/river)
 0.4+ — a poor-man's herbstluftwm successor on Wayland. I hope this reads as a love letter and not a shameless copy. 
 
 Two binaries, mirroring herbstluftwm:
 
-| sommerfluss | herbstluftwm | role |
+| sommerflusswm | herbstluftwm | role |
 |---|---|---|
 | **`sfwm`** | `herbstluftwm` | the window manager (a `river-window-management-v1` client) |
 | **`sc`**   | `herbstclient` | the control client; config is a bash script calling `sc` |
@@ -34,9 +34,9 @@ so `sfwm` must be launched *by* river.
    ```sh
    install -m755 sfwm/examples/river-init ~/.config/river/init
    ```
-2. Install the sommerfluss autostart (the bash config `sfwm` runs; calls `sc`):
+2. Install the sommerflusswm autostart (the bash config `sfwm` runs; calls `sc`):
    ```sh
-   install -Dm755 sfwm/examples/autostart ~/.config/sommerfluss/autostart
+   install -Dm755 sfwm/examples/autostart ~/.config/sommerflusswm/autostart
    ```
 3. Put `sfwm` and `sc` on `PATH`, then start river from a TTY:
    ```sh
@@ -48,7 +48,7 @@ the session — you can iterate and even hot-swap window managers live.
 
 ### IPC socket
 
-`sfwm` listens on `$SOMMERFLUSS_SOCKET`, defaulting to
+`sfwm` listens on `$SOMMERFLUSSWM_SOCKET`, defaulting to
 `$XDG_RUNTIME_DIR/sfwm-$WAYLAND_DISPLAY.sock`. `sc` resolves the same path. Try:
 
 ```sh
@@ -66,6 +66,6 @@ sfwm/                  the window manager
   src/ipc.rs           the sc command dispatcher
   src/protocol.rs      river-window-management-v1 bindings (from the vendored XML)
   protocols/           vendored protocol XML (re-vendor when bumping river)
-  examples/            river-init and the sommerfluss autostart
+  examples/            river-init and the sommerflusswm autostart
 sc/                    the control client (herbstclient successor)
 ```

@@ -3,7 +3,7 @@
 #
 # Keep this minimal: it configures river itself (input, physical output layout via
 # an output-management tool, environment) and then execs sfwm as the LAST line.
-# Everything hlwm-flavored lives in the sommerfluss `autostart` that sfwm launches.
+# Everything hlwm-flavored lives in the sommerflusswm `autostart` that sfwm launches.
 
 # Physical output layout (Wayland moves this out of the WM, not sfwm's job).
 # Configure real output positions here with a wlr-output-management tool, e.g.:

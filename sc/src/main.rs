@@ -1,4 +1,4 @@
-//! sc — the sommerfluss control client (sommerfluss's `herbstclient`).
+//! sc — the sommerflusswm control client (sommerflusswm's `herbstclient`).
 //!
 //! Connects to the sfwm IPC socket, sends its arguments as one command, and
 //! prints the reply. The config layer is a shell script that calls `sc` over and
@@ -13,9 +13,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 /// Resolve the IPC socket path. Kept in sync (by duplication) with sfwm's
-/// `socket_path()` — both honor `SOMMERFLUSS_SOCKET` first.
+/// `socket_path()` — both honor `SOMMERFLUSSWM_SOCKET` first.
 fn socket_path() -> PathBuf {
-    if let Ok(p) = std::env::var("SOMMERFLUSS_SOCKET") {
+    if let Ok(p) = std::env::var("SOMMERFLUSSWM_SOCKET") {
         return PathBuf::from(p);
     }
     let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
@@ -38,7 +38,7 @@ fn main() -> ExitCode {
         Ok(s) => s,
         Err(e) => {
             eprintln!("sc: cannot connect to sfwm at {}: {e}", path.display());
-            eprintln!("    (is sfwm running, and is SOMMERFLUSS_SOCKET/WAYLAND_DISPLAY set?)");
+            eprintln!("    (is sfwm running, and is SOMMERFLUSSWM_SOCKET/WAYLAND_DISPLAY set?)");
             return ExitCode::from(1);
         }
     };

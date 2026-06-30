@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# sommerfluss autostart — the sfwm equivalent of the hlwm autostart.
+# sommerflusswm autostart — the sfwm equivalent of the hlwm autostart.
 #
 # sfwm launches this script on startup (see spawn_autostart in main.rs) with
-# SOMMERFLUSS_SOCKET set, so the `sc` calls below connect back to the running WM.
+# SOMMERFLUSSWM_SOCKET set, so the `sc` calls below connect back to the running WM.
 # This is the bash-config layer: `hc` becomes `sc`, near 1:1 with hlwm.
 #
 # MILESTONE 2 SCOPE: only the monitor topology is implemented in sfwm so far —
@@ -140,5 +140,5 @@ sc pad float1  36 4 4 4
 # Theme/borders/gaps (milestone 6). Scratchpad save/load-state (milestone 6).
 # my_monitor tag affinity + the attribute tree (milestone 4).
 
-echo "sommerfluss autostart: monitors configured" >&2
+echo "sommerflusswm autostart: monitors configured" >&2
 sc list_monitors >&2

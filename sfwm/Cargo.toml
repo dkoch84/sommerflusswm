@@ -2,7 +2,7 @@
 name = "sfwm"
 version = "0.1.0"
 edition = "2021"
-description = "sommerfluss window manager — a herbstluftwm successor on river, with virtual/overlapping monitors"
+description = "sommerflusswm window manager — a herbstluftwm successor on river, with virtual/overlapping monitors"
 
 [[bin]]
 name = "sfwm"

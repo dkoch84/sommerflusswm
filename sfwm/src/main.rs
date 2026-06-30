@@ -1,11 +1,11 @@
-//! sfwm — sommerfluss window manager.
+//! sfwm — sommerflusswm window manager.
 //!
 //! A manual, virtual-monitor tiling window manager for river 0.4+, built as a
 //! herbstluftwm successor. Implemented so far: the monitor model with overlapping
 //! ("virtual") monitors (milestone 2), keyboard bindings via river-xkb-bindings-v1
 //! (part of milestone 5), and the per-tag **frame tree** (milestone 3) — binary
 //! split tree, leaves holding window stacks with max/vertical/horizontal/grid
-//! layouts. All driven at runtime over an `sc` IPC socket (sommerfluss's
+//! layouts. All driven at runtime over an `sc` IPC socket (sommerflusswm's
 //! `herbstclient`).
 //!
 //! Two config layers, mirroring hlwm:
@@ -1115,7 +1115,7 @@ fn tiled_edges(rect: Rect, usable: Rect) -> river_window_v1::Edges {
 
 /// Resolve the IPC socket path. Shared (by duplication) with `sc`.
 fn socket_path() -> PathBuf {
-    if let Ok(p) = std::env::var("SOMMERFLUSS_SOCKET") {
+    if let Ok(p) = std::env::var("SOMMERFLUSSWM_SOCKET") {
         return PathBuf::from(p);
     }
     let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
@@ -1126,21 +1126,21 @@ fn socket_path() -> PathBuf {
 /// Launch the user's `autostart` script, if present, with the socket path in the
 /// environment so the `sc` calls inside it connect back to us. Non-fatal if absent.
 fn spawn_autostart(sock: &std::path::Path) {
-    let path = std::env::var("SOMMERFLUSS_CONFIG").map(PathBuf::from).unwrap_or_else(|_| {
+    let path = std::env::var("SOMMERFLUSSWM_CONFIG").map(PathBuf::from).unwrap_or_else(|_| {
         let cfg = std::env::var("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
                 let home = std::env::var("HOME").unwrap_or_default();
                 PathBuf::from(home).join(".config")
             });
-        cfg.join("sommerfluss").join("autostart")
+        cfg.join("sommerflusswm").join("autostart")
     });
     if !path.exists() {
         eprintln!("sfwm: no autostart at {} (skipping)", path.display());
         return;
     }
     match std::process::Command::new(&path)
-        .env("SOMMERFLUSS_SOCKET", sock)
+        .env("SOMMERFLUSSWM_SOCKET", sock)
         .spawn()
     {
         Ok(_) => eprintln!("sfwm: launched autostart {}", path.display()),

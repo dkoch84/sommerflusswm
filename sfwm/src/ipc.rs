@@ -1,4 +1,4 @@
-//! The IPC command dispatcher — sommerfluss's `herbstclient`-style control surface.
+//! The IPC command dispatcher — sommerflusswm's `herbstclient`-style control surface.
 //!
 //! `sc` connects to the Unix socket, sends a command as NUL-separated argument
 //! bytes, half-closes its write side, and reads the reply text back. This module
@@ -136,7 +136,7 @@ pub(crate) fn dispatch(state: &mut State, args: &[String]) -> String {
             state.emit_hook(&parts);
             ok()
         }
-        "version" => format!("sommerfluss {}\n", env!("CARGO_PKG_VERSION")),
+        "version" => format!("sommerflusswm {}\n", env!("CARGO_PKG_VERSION")),
         // --- object/attribute tree ---
         "attr" => crate::attr::list(state, rest.first().map(|s| s.as_str())),
         "get_attr" => match rest.first() {
