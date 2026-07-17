@@ -45,10 +45,52 @@ fn focused(state: &State) -> Option<WinId> {
     state.focused_window()
 }
 
+// --- user-attribute paths --------------------------------------------------------
+
+/// Canonicalize a user-attribute path (`my_*`, `clients.<focus|id>.my_*`,
+/// `tags.<focus|idx>.my_*`) into the storage key used in `state.user_attrs`,
+/// resolving `focus` to the concrete window id / tag. Returns `None` when the
+/// path is not a user-attribute path at all.
+fn canon_user_key(state: &State, path: &str) -> Option<Result<String, String>> {
+    let p: Vec<&str> = path.split('.').collect();
+    match p.as_slice() {
+        [name] if name.starts_with("my_") => Some(Ok((*name).to_string())),
+        ["clients", sel, name] if name.starts_with("my_") => Some(match *sel {
+            "focus" => match focused(state) {
+                Some(w) => Ok(format!("clients.{w}.{name}")),
+                None => Err("clients.focus: no focused window".into()),
+            },
+            id => match id.parse::<WinId>() {
+                Ok(w) if state.windows.contains_key(&w) => Ok(format!("clients.{w}.{name}")),
+                Ok(w) => Err(format!("no such window: {w}")),
+                Err(_) => Err(format!("bad window id '{id}'")),
+            },
+        }),
+        ["tags", sel, name] if name.starts_with("my_") => Some(match *sel {
+            "focus" => Ok(format!("tags.{}.{name}", state.focused_tag())),
+            idx => match idx.parse::<u32>() {
+                Ok(t) => Ok(format!("tags.{t}.{name}")),
+                Err(_) => Err(format!("bad tag '{idx}'")),
+            },
+        }),
+        _ => None,
+    }
+}
+
 // --- get -----------------------------------------------------------------------
 
 /// Resolve a dot-path to a single attribute value (hlwm `get_attr`).
 pub fn get(state: &State, path: &str) -> Result<String, String> {
+    // User attributes (global or scoped to a client/tag) live in one map keyed
+    // by canonical path; `focus` is resolved at access time.
+    if let Some(key) = canon_user_key(state, path) {
+        let key = key?;
+        return state
+            .user_attrs
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| format!("no such attribute: {path}"));
+    }
     let p: Vec<&str> = path.split('.').collect();
     match p.as_slice() {
         ["settings", name] => settings_get(state, name),
@@ -76,12 +118,6 @@ pub fn get(state: &State, path: &str) -> Result<String, String> {
             let i: usize = idx.parse().map_err(|_| format!("bad monitor '{idx}'"))?;
             monitor_get(state, i, attr)
         }
-
-        [user] if user.starts_with("my_") => state
-            .user_attrs
-            .get(*user)
-            .cloned()
-            .ok_or_else(|| format!("no such attribute: {user}")),
 
         _ => Err(format!("no such attribute: {path}")),
     }
@@ -161,6 +197,14 @@ fn monitor_get(state: &State, i: usize, attr: &str) -> Result<String, String> {
 
 /// Set a writable attribute (hlwm `set_attr`).
 pub fn set(state: &mut State, path: &str, val: &str) -> Result<(), String> {
+    if let Some(key) = canon_user_key(state, path) {
+        let key = key?;
+        if state.user_attrs.contains_key(&key) {
+            state.user_attrs.insert(key, val.to_string());
+            return Ok(());
+        }
+        return Err(format!("no such attribute: {path} (create it with new_attr)"));
+    }
     let p: Vec<&str> = path.split('.').collect();
     match p.as_slice() {
         ["settings", name] => {
@@ -186,14 +230,6 @@ pub fn set(state: &mut State, path: &str, val: &str) -> Result<(), String> {
         ["monitors", idx, attr] => {
             let i: usize = idx.parse().map_err(|_| format!("bad monitor '{idx}'"))?;
             monitor_set(state, i, attr, val)
-        }
-        [user] if user.starts_with("my_") => {
-            if state.user_attrs.contains_key(*user) {
-                state.user_attrs.insert(user.to_string(), val.to_string());
-                Ok(())
-            } else {
-                Err(format!("no such attribute: {user} (create it with new_attr)"))
-            }
         }
         _ => Err(format!("attribute not writable: {path}")),
     }
@@ -267,14 +303,22 @@ fn monitor_set(state: &mut State, i: usize, attr: &str, val: &str) -> Result<(),
 
 // --- user attributes -----------------------------------------------------------
 
-/// Create a user attribute (hlwm `new_attr <type> my_name`). The type is
+/// Create a user attribute (hlwm `new_attr <type> <path>`). The path may be a
+/// bare global name (`my_x`) or scoped to a client/tag
+/// (`clients.focus.my_original_tag`, `tags.3.my_monitor`). The type is
 /// validated against a default value but all values are stored as strings.
-pub fn new_attr(state: &mut State, ty: &str, name: &str) -> Result<(), String> {
-    if !name.starts_with("my_") {
-        return Err("new_attr: user attribute names must start with 'my_'".into());
-    }
-    if state.user_attrs.contains_key(name) {
-        return Err(format!("new_attr: {name} already exists"));
+pub fn new_attr(state: &mut State, ty: &str, path: &str) -> Result<(), String> {
+    let key = match canon_user_key(state, path) {
+        Some(k) => k?,
+        None => {
+            return Err(
+                "new_attr: user attribute names must start with 'my_' (optionally under clients.* or tags.*)"
+                    .into(),
+            )
+        }
+    };
+    if state.user_attrs.contains_key(&key) {
+        return Err(format!("new_attr: {path} already exists"));
     }
     let default = match ty {
         "bool" => "false",
@@ -283,17 +327,27 @@ pub fn new_attr(state: &mut State, ty: &str, name: &str) -> Result<(), String> {
         "color" => "#000000ff",
         _ => return Err(format!("new_attr: unknown type '{ty}'")),
     };
-    state.user_attrs.insert(name.to_string(), default.to_string());
+    state.user_attrs.insert(key, default.to_string());
     Ok(())
 }
 
 /// Remove a user attribute (hlwm `remove_attr`).
-pub fn remove_attr(state: &mut State, name: &str) -> Result<(), String> {
-    if state.user_attrs.remove(name).is_some() {
+pub fn remove_attr(state: &mut State, path: &str) -> Result<(), String> {
+    let key = match canon_user_key(state, path) {
+        Some(k) => k?,
+        None => return Err(format!("remove_attr: not a user attribute: {path}")),
+    };
+    if state.user_attrs.remove(&key).is_some() {
         Ok(())
     } else {
-        Err(format!("remove_attr: no such attribute: {name}"))
+        Err(format!("remove_attr: no such attribute: {path}"))
     }
+}
+
+/// Drop all user attributes scoped to a window that is going away.
+pub fn drop_client_attrs(state: &mut State, wid: WinId) {
+    let prefix = format!("clients.{wid}.");
+    state.user_attrs.retain(|k, _| !k.starts_with(&prefix));
 }
 
 // --- listing -------------------------------------------------------------------
