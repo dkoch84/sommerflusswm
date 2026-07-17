@@ -70,6 +70,8 @@ INPUT BINDINGS
   keybind <mods+key> <command...>  e.g. keybind Super+Return spawn alacritty
   keyunbind <spec|--all> | list_keybinds
   mousebind <mods+button> <move|resize|zoom> | mouseunbind <--all>
+  gesturebind <swipeN-dir> <command...>  e.g. gesturebind swipe3-left use_index +1
+  gestureunbind <spec|--all> | list_gesturebinds   (needs user in `input` group)
 
 RULES
   rule [class~re] [app_id=..] [tag=..] [floating=on] [focus=on] [monitor=..] [dock=top] …

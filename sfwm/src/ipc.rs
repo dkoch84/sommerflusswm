@@ -106,6 +106,9 @@ pub(crate) fn dispatch(state: &mut State, args: &[String]) -> String {
         "spawn" => cmd_spawn(rest),
         "keybind" => cmd_keybind(state, rest),
         "keyunbind" => cmd_keyunbind(state, rest),
+        "gesturebind" => cmd_gesturebind(state, rest),
+        "gestureunbind" => cmd_gestureunbind(state, rest),
+        "list_gesturebinds" => list_gesturebinds(state),
         // frame tree
         "split" => cmd_split(state, rest),
         "focus" => cmd_focus(state, rest),
@@ -581,8 +584,26 @@ fn cmd_bring(state: &mut State, rest: &[String]) -> String {
 
 /// `jumpto <winid>` — focus a window by its `win=` id (and the monitor showing it).
 fn cmd_jumpto(state: &mut State, rest: &[String]) -> String {
-    let Some(wid) = rest.first().and_then(|s| s.parse::<frame::WinId>().ok()) else {
-        return err("jumpto: expected a window id");
+    // hlwm also accepts the `urgent` selector: jump to the first urgent window.
+    let wid = match rest.first().map(|s| s.as_str()) {
+        Some("urgent") => {
+            let mut urgent: Vec<frame::WinId> = state
+                .windows
+                .iter()
+                .filter(|(_, w)| w.urgent)
+                .map(|(wid, _)| *wid)
+                .collect();
+            urgent.sort_unstable();
+            match urgent.first() {
+                Some(w) => *w,
+                None => return err("jumpto: no urgent window"),
+            }
+        }
+        Some(s) => match s.parse::<frame::WinId>() {
+            Ok(w) => w,
+            Err(_) => return err("jumpto: expected a window id or 'urgent'"),
+        },
+        None => return err("jumpto: expected a window id or 'urgent'"),
     };
     if !state.windows.contains_key(&wid) {
         return err(&format!("jumpto: no such window {wid}"));
@@ -1388,6 +1409,48 @@ fn cmd_keyunbind(state: &mut State, _rest: &[String]) -> String {
     state.clear_keybinds();
     state.request_manage();
     ok()
+}
+
+/// `gesturebind <swipeN-dir> <command...>` — bind a touchpad gesture to any
+/// command (native tag switching, spawn <script>, chains, ...).
+fn cmd_gesturebind(state: &mut State, rest: &[String]) -> String {
+    if rest.len() < 2 {
+        return err("gesturebind: expected <swipeN-dir> <command...>");
+    }
+    let spec = match crate::gestures::parse_spec(&rest[0]) {
+        Ok(s) => s,
+        Err(e) => return err(&format!("gesturebind: {e}")),
+    };
+    state.gesturebinds.insert(spec, rest[1..].to_vec());
+    ok()
+}
+
+/// `gestureunbind [--all | <swipeN-dir>]`
+fn cmd_gestureunbind(state: &mut State, rest: &[String]) -> String {
+    match rest.first().map(|s| s.as_str()) {
+        None | Some("--all") => {
+            state.gesturebinds.clear();
+            ok()
+        }
+        Some(spec) => match crate::gestures::parse_spec(spec) {
+            Ok(s) if state.gesturebinds.remove(&s).is_some() => ok(),
+            Ok(s) => err(&format!("gestureunbind: no binding for {s}")),
+            Err(e) => err(&format!("gestureunbind: {e}")),
+        },
+    }
+}
+
+fn list_gesturebinds(state: &State) -> String {
+    let mut specs: Vec<&String> = state.gesturebinds.keys().collect();
+    specs.sort();
+    let mut out = String::new();
+    for s in specs {
+        out.push_str(&format!("{s}\t{}\n", state.gesturebinds[s].join(" ")));
+    }
+    if out.is_empty() {
+        out.push_str("(no gesture bindings)\n");
+    }
+    out
 }
 
 /// Parse a binding spec into `(modifier bits, xkbcommon keysym)`. Modifier bits

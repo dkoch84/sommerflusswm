@@ -32,3 +32,7 @@ zbus = "4"
 # nm-applet's). Pure Rust (usvg + tiny-skia), no GTK/librsvg. Same crate the
 # appearance GUI uses.
 resvg = "0.47"
+# Touchpad gestures: river doesn't forward gestures to the WM, so read libinput
+# directly (udev backend; user must be in the `input` group).
+input = "0.9"
+libc = "0.2"

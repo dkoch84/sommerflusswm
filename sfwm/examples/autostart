@@ -3,26 +3,46 @@ Mod=Super
 sc keyunbind --all
 sc mouseunbind --all
 
-# programs
+# programs (same keys as the herbstluftwm config)
 sc keybind $Mod-Return spawn alacritty
-sc keybind $Mod-q spawn qutebrowser
-sc keybind $Mod-d spawn dolphin --platformtheme qt6ct
+sc keybind $Mod-apostrophe spawn "$HOME/work/projects/rat/rat"
 sc keybind $Mod-c spawn code
+sc keybind $Mod-q spawn qutebrowser
+sc keybind $Mod-w spawn qutebrowser.wrapper "https://youtube.com"
+sc keybind $Mod-v spawn "$HOME/scripts/utils/chrome-debug"
+sc keybind $Mod-b spawn microsoft-edge-stable
+sc keybind $Mod-e spawn qutebrowser.matrix "https://app.element.io/#/room/!UDQUAzsPpbcPRJevFT:matrix.org"
+sc keybind $Mod-t spawn "$HOME/scripts/utils/chromer" evergy
+sc keybind $Mod-d spawn dolphin --platformtheme qt6ct
 sc keybind $Mod-Shift-s spawn flameshot gui
-sc keybind $Mod-m      launcher
+sc keybind $Mod-Shift-f spawn flameshot gui -p "$HOME/shots"
+sc keybind $Mod-m       launcher
+sc keybind Alt-Tab      spawn "$HOME/scripts/sfwm/window-switcher.sh"
+
+# media / fn keys
+sc keybind XF86AudioLowerVolume spawn "$HOME/scripts/utils/dankvol" -s 2
+sc keybind XF86AudioRaiseVolume spawn "$HOME/scripts/utils/dankvol" -d 2
+sc keybind XF86MonBrightnessDown spawn /usr/bin/light -U 5
+sc keybind XF86MonBrightnessUp   spawn /usr/bin/light -A 5
 
 # session
 sc keybind $Mod-Shift-q quit
 sc keybind $Mod-Shift-r reload
 
-# tags
+# tags — if the tag is locked to a monitor via tags.N.my_monitor, focus that
+# monitor first (the hlwm chain trick, verbatim apart from hc->sc).
 for i in 1 2 3 4 5 6 7 8 9; do
-  sc keybind "$Mod-$i"       use  "$i"
+  sc new_attr string tags.$i.my_monitor 2>/dev/null
+  sc keybind "$Mod-$i" \
+    chain , silent substitute M tags.$i.my_monitor focus_monitor M \
+          , use "$i"
   sc keybind "$Mod-Shift-$i" move "$i"
 done
 sc keybind $Mod-period use_index +1 --skip-visible
 sc keybind $Mod-comma  use_index -1 --skip-visible
 sc keybind $Mod-BackSpace cycle_monitor
+# drop the focused tag's monitor lock
+sc keybind $Mod-Shift-t remove_attr tags.focus.my_monitor
 
 # focus / move within the frame tree
 for p in "Left left" "Down down" "Up up" "Right right" "h left" "j down" "k up" "l right"; do
@@ -48,6 +68,11 @@ sc keybind $Mod-r         remove
 sc keybind $Mod-g         cycle
 sc keybind $Mod-Tab       cycle_all +1
 sc keybind $Mod-Shift-Tab cycle_all -1
+sc keybind $Mod-i         jumpto urgent
+
+# scripts (sc ports of the herbst helpers)
+sc keybind $Mod-s spawn "$HOME/scripts/sfwm/float-toggle.sh"
+sc keybind $Mod-z spawn "$HOME/scripts/sfwm/resize-viewport.sh"
 
 # per-window modes
 sc keybind $Mod-Shift-c     close
@@ -57,7 +82,18 @@ sc keybind $Mod-Shift-space floating toggle
 
 # mouse
 sc mousebind $Mod-Button1       move
+sc mousebind $Mod-Button2       zoom
 sc mousebind $Mod-Shift-Button1 resize
+
+# touchpad gestures (native libinput recognition; needs the user in the
+# `input` group — sfwm logs "gestures disabled" otherwise). Left/right cycle
+# tags like Mod-period/comma; up floats the window to the scratchpad, down
+# returns it (both via the float-toggle script, so the behavior is scriptable).
+sc gestureunbind --all
+sc gesturebind swipe3-left  use_index +1 --skip-visible
+sc gesturebind swipe3-right use_index -1 --skip-visible
+sc gesturebind swipe3-up    spawn "$HOME/scripts/sfwm/float-toggle.sh"
+sc gesturebind swipe3-down  spawn "$HOME/scripts/sfwm/float-toggle.sh"
 
 # theme
 sc set window_gap 8

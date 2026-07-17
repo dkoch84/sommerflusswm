@@ -15,6 +15,7 @@
 
 mod attr;
 mod frame;
+mod gestures;
 mod ipc;
 mod launcher;
 mod monitor;
@@ -640,6 +641,10 @@ struct State {
     /// Bindings created but not yet `enable()`d — enabling is window-management
     /// state and must happen inside a manage sequence (see do_manage).
     pending_enable: Vec<RiverXkbBindingV1>,
+    /// Touchpad gesture recognition (direct libinput; None if unavailable).
+    gestures: Option<gestures::Gestures>,
+    /// Gesture bindings: normalized spec ("swipe3-left") → command argv.
+    gesturebinds: HashMap<String, Vec<String>>,
 
     // --- theming ---
     border_width: i32,
@@ -3423,6 +3428,8 @@ fn main() {
         xkb_bindings,
         keybinds: HashMap::new(),
         pending_enable: Vec::new(),
+        gestures: None,
+        gesturebinds: HashMap::new(),
         border_width: 0,
         border_active: (0x4e, 0x9b, 0xcf, 0xff),
         border_normal: (0x1d, 0x25, 0x2b, 0xff),
@@ -3556,6 +3563,35 @@ fn main() {
         )
         .expect("failed to insert the IPC source into the event loop");
 
+    // Touchpad gestures: read libinput directly (river doesn't forward
+    // gestures to the WM). Non-fatal if unavailable — needs the `input` group.
+    match gestures::Gestures::new() {
+        Ok(g) => {
+            let raw = g.raw_fd();
+            state.gestures = Some(g);
+            handle
+                .insert_source(
+                    Generic::new(
+                        unsafe { calloop::generic::FdWrapper::new(raw) },
+                        Interest::READ,
+                        Mode::Level,
+                    ),
+                    |_readiness, _fd, state: &mut State| {
+                        let specs = state.gestures.as_mut().map(|g| g.poll()).unwrap_or_default();
+                        for spec in specs {
+                            if let Some(cmd) = state.gesturebinds.get(&spec).cloned() {
+                                let _ = ipc::dispatch(state, &cmd);
+                            }
+                        }
+                        Ok(PostAction::Continue)
+                    },
+                )
+                .expect("failed to insert the gesture source into the event loop");
+            eprintln!("sfwm: touchpad gestures enabled");
+        }
+        Err(e) => eprintln!("sfwm: touchpad gestures disabled: {e}"),
+    }
+
     spawn_autostart(&sock);
 
     eprintln!("sfwm: connected, entering event loop");
@@ -3657,6 +3693,7 @@ impl Dispatch<RiverWindowV1, ()> for State {
                             o.viewport.destroy();
                             o.surface.destroy();
                         }
+                        crate::attr::drop_client_attrs(state, wid);
                     }
                 }
                 win.destroy();
