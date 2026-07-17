@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Build sommerflusswm packages and publish them to the dankops pacman repo.
+#
+# The repo lives in the dankops project (shared by all dank packages) and is
+# served by the NAS at http://192.168.1.7/dankops/$arch — see
+# dankops/pkg/pkg/arch/REPO.md. On workstations, ~/work is NFS from the NAS,
+# so a repo-add here IS the publish; clients just `pacman -Syu`.
+#
+# Usage: packaging/release [wm|appearance|all] [--bump-rel]
+#   wm          build + publish sommerflusswm (sfwm + sc)
+#   appearance  build + publish sommerflusswm-appearance
+#   all         both (default)
+#   --bump-rel  increment pkgrel in the PKGBUILD(s) before building
+#
+# Sources are archived from the WORKING TREE (git stash create), not HEAD, so
+# uncommitted work is what ships — same flow as always. Also keeps pkg/ holding
+# exactly the latest build of each package (the VM-mount convention).
+set -euo pipefail
+
+PROJ="$(cd "$(dirname "$0")/.." && pwd)"
+# NAS: work folder is ~/nasraid/work; everywhere else ~/work (matches dankops2).
+if [ -d "$HOME/nasraid/work" ]; then
+    REPO_DIR="$HOME/nasraid/work/projects/dankops/pkg/arch/repo/x86_64"
+else
+    REPO_DIR="$HOME/work/projects/dankops/pkg/arch/repo/x86_64"
+fi
+
+target="all"
+bump_rel=0
+for arg in "$@"; do
+    case "$arg" in
+        wm|appearance|all) target="$arg" ;;
+        --bump-rel) bump_rel=1 ;;
+        *) echo "usage: packaging/release [wm|appearance|all] [--bump-rel]" >&2; exit 2 ;;
+    esac
+done
+
+# One source tarball from the working tree serves both PKGBUILDs (both expect
+# sommerflusswm-$pkgver.tar.gz extracting to sommerflusswm-$pkgver/).
+make_tarball() {
+    local dest="$1" ver="$2"
+    cd "$PROJ"
+    local tree
+    tree=$(git stash create)
+    git archive --prefix="sommerflusswm-$ver/" -o "$dest/sommerflusswm-$ver.tar.gz" "${tree:-HEAD}"
+}
+
+# build <pkgbuild-dir>: bump (optional), makepkg, publish to repo + pkg/.
+build_one() {
+    local dir="$1"
+    cd "$dir"
+    local name ver rel
+    name=$(grep '^pkgname=' PKGBUILD | cut -d= -f2)
+
+    if [ "$bump_rel" = 1 ]; then
+        rel=$(grep '^pkgrel=' PKGBUILD | cut -d= -f2)
+        sed -i "s/^pkgrel=.*/pkgrel=$((rel + 1))/" PKGBUILD
+    fi
+    ver=$(grep '^pkgver=' PKGBUILD | cut -d= -f2)
+    rel=$(grep '^pkgrel=' PKGBUILD | cut -d= -f2)
+    echo "==> $name $ver-$rel"
+
+    make_tarball "$dir"
+    cd "$dir"
+    rm -rf src pkg
+    rm -f ./*.pkg.tar*
+    makepkg -df --nocheck
+
+    # pkg/ keeps exactly the latest build of each package.
+    rm -f "$PROJ/pkg/${name}"-[0-9]*.pkg.tar*
+    cp "${name}-${ver}-${rel}"-*.pkg.tar.zst "$PROJ/pkg/"
+
+    # Publish: replace any older build of this package in the shared repo.
+    mkdir -p "$REPO_DIR"
+    rm -f "$REPO_DIR/${name}"-[0-9]*.pkg.tar*
+    mv "${name}-${ver}-${rel}"-*.pkg.tar.zst "$REPO_DIR/"
+
+    rm -rf src pkg sommerflusswm-0.1.0.tar.gz
+}
+
+case "$target" in
+    wm)         build_one "$PROJ/packaging" ;;
+    appearance) build_one "$PROJ/packaging/appearance" ;;
+    all)        build_one "$PROJ/packaging"; build_one "$PROJ/packaging/appearance" ;;
+esac
+
+echo "==> Reindexing dankops repo..."
+repo-add "$REPO_DIR/dankops.db.tar.zst" "$REPO_DIR"/sommerflusswm*.pkg.tar.zst
+echo "==> Published. Clients: sudo pacman -Syu"

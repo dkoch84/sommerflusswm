@@ -13,6 +13,7 @@
 #   herbst/ — the herbstluftwm config being ported (its own git repo)
 /files/
 /herbst/
+/tint2/
 
 # Editor / tooling local state
 /.claude/
