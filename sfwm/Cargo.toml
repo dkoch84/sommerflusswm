@@ -20,3 +20,15 @@ calloop = "0.14"
 calloop-wayland-source = "0.4"
 # Resolve key names (incl. XF86*) to xkbcommon keysyms for river_xkb_bindings_v1.
 xkbcommon = "0.9"
+# Text shaping + rasterization for the WM-drawn status bar (no toolkit/X). Pulls
+# in fontdb for system-font discovery + fallback (Iosevka / Font Awesome / etc).
+cosmic-text = "0.12"
+# Decode + scale wallpaper images for the WM-drawn background (no toolkit/X).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif"] }
+# D-Bus, for the built-in org.freedesktop.Notifications service (replaces dunst)
+# and the SNI system tray.
+zbus = "4"
+# Rasterize SVG tray icons (most modern themes ship SVG-only status icons, e.g.
+# nm-applet's). Pure Rust (usvg + tiny-skia), no GTK/librsvg. Same crate the
+# appearance GUI uses.
+resvg = "0.47"

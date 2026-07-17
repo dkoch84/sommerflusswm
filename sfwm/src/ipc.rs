@@ -19,7 +19,10 @@ use std::time::Duration;
 
 use crate::frame;
 use crate::monitor::{Insets, MonitorSel, Rect, TagId};
-use crate::{Rule, State};
+use crate::{
+    Bar, BarModule, DockAnchor, ExecMode, Executor, Rule, SepStyle, State, WallMode,
+    WallpaperContent,
+};
 
 /// Read one request from `stream`, dispatch it, and write the reply back.
 pub fn handle_connection(mut stream: UnixStream, state: &mut State) {
@@ -41,6 +44,14 @@ pub fn handle_connection(mut stream: UnixStream, state: &mut State) {
     if matches!(args.first().map(String::as_str), Some("--idle") | Some("-i")) {
         let _ = stream.set_read_timeout(None);
         state.idle_clients.push(stream);
+        return;
+    }
+
+    // `sc menu`: dmenu mode. The remaining args are the menu items; hold the
+    // connection open and reply with the chosen line once the user picks.
+    if args.first().map(String::as_str) == Some("menu") {
+        let _ = stream.set_read_timeout(None);
+        state.open_launcher_menu(args[1..].to_vec(), stream);
         return;
     }
 
@@ -133,6 +144,14 @@ pub(crate) fn dispatch(state: &mut State, args: &[String]) -> String {
         "pseudotile" => cmd_window_mode(state, rest, WinMode::Pseudotile),
         "floating" => cmd_floating(state, rest),
         "floating_geometry" => cmd_floating_geometry(state, rest),
+        "dock" => cmd_dock(state, rest),
+        "bar" => cmd_bar(state, rest),
+        "tray" => cmd_tray(state),
+        "wallpaper" => cmd_wallpaper(state, rest),
+        "launcher" => {
+            state.open_launcher();
+            ok()
+        }
         // mouse, rules, affinity
         "mousebind" => cmd_mousebind(state, rest),
         "mouseunbind" => cmd_mouseunbind(state, rest),
@@ -703,6 +722,60 @@ fn cmd_set(state: &mut State, rest: &[String]) -> String {
             }
             Err(_) => return err("set inactive_dim: expected a number 0.0..=1.0"),
         },
+        // --- notification theming (popups drawn by the built-in dunst replacement)
+        "notify_bg" => match parse_color(v) {
+            Some(c) => state.notif_theme.bg = c,
+            None => return err("set: bad colour (use #rrggbb)"),
+        },
+        "notify_fg" => match parse_color(v) {
+            Some(c) => state.notif_theme.fg = c,
+            None => return err("set: bad colour (use #rrggbb)"),
+        },
+        "notify_body_fg" => match parse_color(v) {
+            Some(c) => state.notif_theme.body_fg = c,
+            None => return err("set: bad colour (use #rrggbb)"),
+        },
+        "notify_accent" => match parse_color(v) {
+            Some(c) => state.notif_theme.accent = c,
+            None => return err("set: bad colour (use #rrggbb)"),
+        },
+        "notify_accent_critical" => match parse_color(v) {
+            Some(c) => state.notif_theme.accent_critical = c,
+            None => return err("set: bad colour (use #rrggbb)"),
+        },
+        "notify_width" => match v.parse::<i32>() {
+            Ok(n) => state.notif_theme.width = n.max(120),
+            Err(_) => return err("set notify_width: expected an integer"),
+        },
+        "notify_timeout" => match v.parse::<i32>() {
+            Ok(n) => state.notif_theme.timeout_ms = n.max(0),
+            Err(_) => return err("set notify_timeout: expected milliseconds"),
+        },
+        // --- launcher theming (launcher_dim accepts #rrggbbaa for the see-through)
+        "launcher_dim" => match parse_color(v) {
+            Some(c) => state.launcher_theme.dim = c,
+            None => return err("set: bad colour (use #rrggbb or #rrggbbaa)"),
+        },
+        "launcher_bg" => match parse_color(v) {
+            Some(c) => state.launcher_theme.bg = c,
+            None => return err("set: bad colour (use #rrggbb)"),
+        },
+        "launcher_fg" => match parse_color(v) {
+            Some(c) => state.launcher_theme.fg = c,
+            None => return err("set: bad colour (use #rrggbb)"),
+        },
+        "launcher_sel_bg" => match parse_color(v) {
+            Some(c) => state.launcher_theme.sel_bg = c,
+            None => return err("set: bad colour (use #rrggbb)"),
+        },
+        "launcher_sel_fg" => match parse_color(v) {
+            Some(c) => state.launcher_theme.sel_fg = c,
+            None => return err("set: bad colour (use #rrggbb)"),
+        },
+        "launcher_width" => match v.parse::<i32>() {
+            Ok(n) => state.launcher_theme.width = n.max(240),
+            Err(_) => return err("set launcher_width: expected an integer"),
+        },
         "raise_on_focus" => state.raise_on_focus = parse_bool(v),
         "smart_frame_surroundings" => state.smart_frame_surroundings = parse_bool(v),
         "smart_window_surroundings" => state.smart_window_surroundings = parse_bool(v),
@@ -843,6 +916,7 @@ fn cmd_rule(state: &mut State, rest: &[String]) -> String {
         pseudotile: None,
         focus: None,
         switchtag: None,
+        dock: None,
     };
     for tok in rest {
         let (key, exact, val) = if let Some(i) = tok.find('~') {
@@ -862,6 +936,7 @@ fn cmd_rule(state: &mut State, rest: &[String]) -> String {
             "pseudotile" => rule.pseudotile = Some(on),
             "focus" => rule.focus = Some(on),
             "switchtag" => rule.switchtag = Some(on),
+            "dock" => rule.dock = parse_dock(val),
             // accepted but not yet acted on
             "manage" | "windowtype" => {}
             _ => {}
@@ -873,6 +948,397 @@ fn cmd_rule(state: &mut State, rest: &[String]) -> String {
 
 fn cmd_unrule(state: &mut State) -> String {
     state.rules.clear();
+    ok()
+}
+
+/// Parse a `dock=` value: `top`/`bottom`/`on` (defaults to top) → an anchor;
+/// anything falsey → `None` (not a dock).
+fn parse_dock(val: &str) -> Option<DockAnchor> {
+    match val.to_ascii_lowercase().as_str() {
+        "top" | "on" | "true" | "1" | "yes" => Some(DockAnchor::Top),
+        "bottom" | "bot" => Some(DockAnchor::Bottom),
+        _ => None,
+    }
+}
+
+/// `dock [top|bottom|off]` — turn the focused window into a dock (status bar)
+/// pinned to an edge, or `off` to return it to normal tiling. Convenience for
+/// designating an already-running bar (e.g. tint2 under Xwayland) without a rule
+/// + relaunch.
+fn cmd_dock(state: &mut State, rest: &[String]) -> String {
+    let Some(wid) = state.focused_window() else {
+        return err("dock: no focused window");
+    };
+    match rest.first().map(|s| s.as_str()).unwrap_or("top") {
+        "off" | "none" | "false" => {
+            if let Some(w) = state.windows.get_mut(&wid) {
+                w.dock = None;
+            }
+        }
+        v => {
+            let anchor = parse_dock(v).unwrap_or(DockAnchor::Top);
+            state.make_dock(wid, anchor);
+        }
+    }
+    state.request_manage();
+    ok()
+}
+
+/// `tray` — dump the WM's current SNI tray state (a diagnostic). Also whether the
+/// bar has a `tray` module to draw them in, since the two are independent.
+fn cmd_tray(state: &State) -> String {
+    let has_module = state.bar.as_ref().is_some_and(|b| {
+        b.modules
+            .iter()
+            .any(|m| matches!(m, crate::BarModule::Tray { .. }))
+    });
+    let mut out = format!(
+        "tray: {} item(s); bar tray module: {}\n",
+        state.tray_items.len(),
+        if has_module { "present" } else { "MISSING (run `sc bar add tray`)" }
+    );
+    if state.tray_items.is_empty() {
+        out.push_str("  (no SNI item registered — is a tray app running in SNI mode, e.g. `nm-applet --indicator`?)\n");
+    }
+    for it in &state.tray_items {
+        out.push_str(&format!(
+            "  {} status={} icon={} title={:?}\n",
+            it.key,
+            it.status,
+            if it.icon.is_some() { "yes" } else { "no(placeholder)" },
+            it.title,
+        ));
+    }
+    out
+}
+
+/// `bar <subcommand>` — the WM-drawn status bar. Phase A: only `create`.
+fn cmd_bar(state: &mut State, rest: &[String]) -> String {
+    match rest.first().map(|s| s.as_str()) {
+        Some("create") => cmd_bar_create(state, &rest[1..]),
+        Some("add") => cmd_bar_add(state, &rest[1..]),
+        Some("clear") => {
+            state.teardown_bar_modules();
+            state.request_manage();
+            ok()
+        }
+        Some("destroy") => {
+            state.destroy_bar();
+            state.request_manage();
+            ok()
+        }
+        Some(other) => err(&format!("bar: unknown subcommand '{other}'")),
+        None => err("bar: expected a subcommand (create/add/clear)"),
+    }
+}
+
+/// `bar add <executor|separator|spacer> …` — append a module to the bar.
+fn cmd_bar_add(state: &mut State, args: &[String]) -> String {
+    if state.bar.is_none() {
+        return err("bar add: no bar yet (run 'bar create' first)");
+    }
+    match args.first().map(|s| s.as_str()) {
+        Some("executor") => cmd_bar_add_executor(state, &args[1..]),
+        Some("separator") => {
+            let mut size = 6i32;
+            let mut color = (0x77u8, 0x77u8, 0x77u8, 0xffu8);
+            let mut style = SepStyle::Line;
+            for tok in &args[1..] {
+                if let Some(v) = tok.strip_prefix("size=") {
+                    if let Ok(n) = v.parse::<i32>() {
+                        size = n.max(0);
+                    }
+                } else if let Some(v) = tok.strip_prefix("color=") {
+                    if let Some(c) = parse_color(v) {
+                        color = c;
+                    }
+                } else if let Some(v) = tok.strip_prefix("style=") {
+                    style = match v {
+                        "line" => SepStyle::Line,
+                        "empty" | "none" | "invisible" => SepStyle::Empty,
+                        "dot" => SepStyle::Dot,
+                        _ => return err(&format!("bar add separator: unknown style '{v}'")),
+                    };
+                } else {
+                    return err(&format!("bar add separator: unknown option '{tok}'"));
+                }
+            }
+            state
+                .bar
+                .as_mut()
+                .unwrap()
+                .modules
+                .push(BarModule::Separator { size, color, style });
+            state.request_manage();
+            ok()
+        }
+        Some("spacer") => {
+            state.bar.as_mut().unwrap().modules.push(BarModule::Spacer);
+            state.request_manage();
+            ok()
+        }
+        Some("tray") => {
+            // `bar add tray [size=N] [spacing=N]` — size 0 (default) = auto (bar height).
+            let mut size = 0i32;
+            let mut spacing = 6i32;
+            for tok in &args[1..] {
+                if let Some(v) = tok.strip_prefix("size=") {
+                    if let Ok(n) = v.parse::<i32>() {
+                        size = n.max(0);
+                    }
+                } else if let Some(v) = tok.strip_prefix("spacing=") {
+                    if let Ok(n) = v.parse::<i32>() {
+                        spacing = n.max(0);
+                    }
+                } else {
+                    return err(&format!("bar add tray: unknown option '{tok}'"));
+                }
+            }
+            state
+                .bar
+                .as_mut()
+                .unwrap()
+                .modules
+                .push(BarModule::Tray { size, spacing });
+            state.request_manage();
+            ok()
+        }
+        Some(other) => err(&format!("bar add: unknown module '{other}'")),
+        None => err("bar add: expected executor|separator|spacer|tray"),
+    }
+}
+
+/// `bar add executor '<cmd>' [interval=N | continuous] [fg=] [bg=] [pad=] [lclick=] [rclick=]`
+fn cmd_bar_add_executor(state: &mut State, args: &[String]) -> String {
+    let Some((cmd, opts)) = args.split_first() else {
+        return err("bar add executor: expected a command");
+    };
+    let mut mode = ExecMode::Interval(0); // default: run once
+    let mut fg = None;
+    let mut bg = None;
+    let mut pad = 4i32;
+    let mut lclick = None;
+    let mut rclick = None;
+    let mut family = None;
+    let mut size = None;
+    for tok in opts {
+        if tok == "continuous" {
+            mode = ExecMode::Continuous;
+        } else if let Some(v) = tok.strip_prefix("interval=") {
+            match v.parse::<u64>() {
+                Ok(n) => mode = ExecMode::Interval(n),
+                Err(_) => return err(&format!("bar add executor: bad interval '{v}'")),
+            }
+        } else if let Some(v) = tok.strip_prefix("fg=") {
+            fg = parse_color(v);
+        } else if let Some(v) = tok.strip_prefix("bg=") {
+            bg = parse_color(v);
+        } else if let Some(v) = tok.strip_prefix("pad=") {
+            if let Ok(n) = v.parse::<i32>() {
+                pad = n.max(0);
+            }
+        } else if let Some(v) = tok.strip_prefix("lclick=") {
+            lclick = Some(v.to_string());
+        } else if let Some(v) = tok.strip_prefix("rclick=") {
+            rclick = Some(v.to_string());
+        } else if let Some(v) = tok.strip_prefix("family=") {
+            family = Some(v.to_string());
+        } else if let Some(v) = tok.strip_prefix("size=") {
+            match v.parse::<f32>() {
+                Ok(n) if n >= 1.0 => size = Some(n),
+                _ => return err(&format!("bar add executor: bad size '{v}'")),
+            }
+        } else {
+            return err(&format!("bar add executor: unknown option '{tok}'"));
+        }
+    }
+
+    let id = state.next_bar_module;
+    state.next_bar_module += 1;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let child = state.spawn_executor(id, cmd.clone(), mode, stop.clone());
+    let exec =
+        Executor { id, fg, bg, pad, family, size, lclick, rclick, text: String::new(), stop, child };
+    state.bar.as_mut().unwrap().modules.push(BarModule::Executor(exec));
+    state.request_manage();
+    ok()
+}
+
+/// `bar create [top|bottom] [height=N] [bg=#rrggbb]` — make the status bar: a
+/// river shell surface placed in the render list, drawn by sfwm.
+fn cmd_bar_create(state: &mut State, opts: &[String]) -> String {
+    let Some(comp) = state.compositor.clone() else {
+        return err("bar: no wl_compositor");
+    };
+    let Some(wm) = state.wm.clone() else {
+        return err("bar: no window manager");
+    };
+    if state.shm.is_none() {
+        return err("bar: no wl_shm");
+    }
+
+    let mut anchor = DockAnchor::Top;
+    let mut height = 26i32;
+    let mut bg = (0xf7u8, 0xf8u8, 0xf3u8, 0xffu8);
+    let mut fg = (0x1du8, 0x25u8, 0x2bu8, 0xffu8);
+    let mut font_size = 14.0f32;
+    let mut margin_x = 0i32;
+    let mut margin_y = 0i32;
+    for tok in opts {
+        match tok.as_str() {
+            "top" => anchor = DockAnchor::Top,
+            "bottom" => anchor = DockAnchor::Bottom,
+            _ if tok.starts_with("height=") => {
+                if let Ok(h) = tok["height=".len()..].parse::<i32>() {
+                    height = h.max(1);
+                }
+            }
+            // Float the bar: `margin=N` insets both axes; `marginx=`/`marginy=`
+            // set them separately (tint2's panel_margin "H V").
+            _ if tok.starts_with("marginx=") => {
+                if let Ok(n) = tok["marginx=".len()..].parse::<i32>() {
+                    margin_x = n.max(0);
+                }
+            }
+            _ if tok.starts_with("marginy=") => {
+                if let Ok(n) = tok["marginy=".len()..].parse::<i32>() {
+                    margin_y = n.max(0);
+                }
+            }
+            _ if tok.starts_with("margin=") => {
+                if let Ok(n) = tok["margin=".len()..].parse::<i32>() {
+                    margin_x = n.max(0);
+                    margin_y = n.max(0);
+                }
+            }
+            _ if tok.starts_with("bg=") => {
+                if let Some(c) = parse_color(&tok["bg=".len()..]) {
+                    bg = c;
+                }
+            }
+            _ if tok.starts_with("fg=") => {
+                if let Some(c) = parse_color(&tok["fg=".len()..]) {
+                    fg = c;
+                }
+            }
+            _ if tok.starts_with("font=") => {
+                if let Ok(n) = tok["font=".len()..].parse::<f32>() {
+                    font_size = n.max(1.0);
+                }
+            }
+            _ => return err(&format!("bar create: unknown option '{tok}'")),
+        }
+    }
+
+    // Re-creating over an existing bar: REUSE its shell surface/node instead of
+    // destroy + recreate. river does not reliably composite a freshly re-created
+    // shell surface until the next full render, so `sc reload` (which re-runs
+    // `sc bar create`) made the panel vanish until a tag switch. Reusing keeps the
+    // surface mapped and its buffer on screen; we only stop the old executors and
+    // reset the modules + properties. (`sc bar destroy` still tears it down fully.)
+    state.teardown_bar_modules();
+    let qh = state.qh.clone();
+    let (surface, shell, node, buffer, backing, old) = match state.bar.take() {
+        Some(b) => (b.surface, b.shell, b.node, b.buffer, b.backing, b.old),
+        None => {
+            // Surface must have no role/buffer before get_shell_surface; a buffer
+            // is attached later, in the render pass.
+            let surface = comp.create_surface(&qh, ());
+            let shell = wm.get_shell_surface(&surface, &qh, ());
+            let node = shell.get_node(&qh, ());
+            (surface, shell, node, None, None, None)
+        }
+    };
+    state.bar = Some(Bar {
+        surface,
+        shell,
+        node,
+        anchor,
+        height,
+        margin_x,
+        margin_y,
+        bg,
+        fg,
+        font_size,
+        modules: Vec::new(),
+        buffer,
+        backing,
+        old,
+        hit: Vec::new(),
+        origin: (0, 0),
+    });
+    state.request_manage();
+    ok()
+}
+
+/// `wallpaper color <#rrggbb> [monitor=N|all]`
+/// `wallpaper <path> [mode=fill|fit|stretch|center|tile] [monitor=N|all]`
+/// `wallpaper off [monitor=N|all]`
+///
+/// Draws a per-monitor background on the bottom of the render list. sfwm draws it
+/// itself because external tools (swaybg) can't composite a layer surface under
+/// it. `monitor` defaults to all monitors; the subcommand/path must come first.
+fn cmd_wallpaper(state: &mut State, rest: &[String]) -> String {
+    let Some(first) = rest.first() else {
+        return err("wallpaper: expected 'color <#rrggbb>', a <path>, or 'off'");
+    };
+
+    // monitor= / mode= may appear anywhere after the subcommand.
+    let mut monitor: Option<String> = None;
+    let mut mode = WallMode::Fill;
+    for tok in &rest[1..] {
+        if let Some(v) = tok.strip_prefix("monitor=") {
+            monitor = Some(v.to_string());
+        } else if let Some(v) = tok.strip_prefix("mode=") {
+            mode = match v {
+                "fill" => WallMode::Fill,
+                "fit" => WallMode::Fit,
+                "stretch" => WallMode::Stretch,
+                "center" => WallMode::Center,
+                "tile" => WallMode::Tile,
+                _ => return err(&format!("wallpaper: unknown mode '{v}'")),
+            };
+        }
+    }
+
+    let mons: Vec<usize> = match monitor.as_deref() {
+        None | Some("all") => (0..state.monitors.list.len()).collect(),
+        Some(sel) => match state.monitors.resolve(&MonitorSel::parse(sel)) {
+            Some(i) => vec![i],
+            None => return err(&format!("wallpaper: no such monitor '{sel}'")),
+        },
+    };
+    if mons.is_empty() {
+        return err("wallpaper: no monitors");
+    }
+
+    match first.as_str() {
+        "off" => match monitor.as_deref() {
+            None | Some("all") => state.destroy_wallpaper(None),
+            _ => {
+                for m in &mons {
+                    state.destroy_wallpaper(Some(*m));
+                }
+            }
+        },
+        "color" => {
+            let Some(hex) = rest.get(1) else {
+                return err("wallpaper color: expected #rrggbb");
+            };
+            let Some(c) = parse_color(hex) else {
+                return err("wallpaper color: bad colour (use #rrggbb)");
+            };
+            state.set_wallpaper(&mons, WallpaperContent::Color(c));
+        }
+        path => {
+            let pb = std::path::PathBuf::from(path);
+            if !pb.is_file() {
+                return err(&format!("wallpaper: no such file '{path}'"));
+            }
+            state.set_wallpaper(&mons, WallpaperContent::Image { path: pb, mode });
+        }
+    }
+    state.request_manage();
     ok()
 }
 

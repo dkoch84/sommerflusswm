@@ -16,8 +16,11 @@
 mod attr;
 mod frame;
 mod ipc;
+mod launcher;
 mod monitor;
+mod notify;
 mod protocol;
+mod tray;
 
 use frame::{Frame, WinId};
 use monitor::{Monitors, Rect, TagId};
@@ -32,12 +35,19 @@ use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, Mode, PostAction};
 use calloop_wayland_source::WaylandSource;
 
+use std::os::fd::AsFd;
+
 use wayland_client::{
     backend::ObjectId,
     event_created_child,
     globals::{registry_queue_init, GlobalListContents},
-    protocol::{wl_buffer::WlBuffer, wl_compositor::WlCompositor, wl_registry, wl_surface::WlSurface},
-    Connection, Dispatch, Proxy, QueueHandle,
+    protocol::{
+        wl_buffer::WlBuffer, wl_compositor::WlCompositor, wl_keyboard::{self, WlKeyboard},
+        wl_pointer::{self, WlPointer},
+        wl_registry, wl_seat::{self, WlSeat}, wl_shm, wl_shm::WlShm,
+        wl_shm_pool::WlShmPool, wl_surface::WlSurface,
+    },
+    Connection, Dispatch, Proxy, QueueHandle, WEnum,
 };
 use wayland_protocols::wp::single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1;
 use wayland_protocols::wp::viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter};
@@ -98,6 +108,9 @@ struct Window {
     rules_applied: bool,
     /// Window requested attention (xdg-activation / urgency) and isn't focused.
     urgent: bool,
+    /// If set, this window is a dock (status bar): sticky across tags,
+    /// unfocusable, untiled, pinned full-width to the named edge.
+    dock: Option<DockAnchor>,
     /// The "dim inactive" decoration overlay, created lazily (see [`DimOverlay`]).
     dim: Option<DimOverlay>,
 }
@@ -113,6 +126,274 @@ struct DimOverlay {
     shown: bool,
     /// Last destination size set on the viewport (to avoid redundant commits).
     size: (i32, i32),
+}
+
+/// A WM-owned status bar: a `river_shell_surface_v1` placed in the render list,
+/// drawn by sfwm into a `wl_shm` buffer (no Xwayland, no toolkit). Holds an
+/// ordered list of modules (executors / separators / spacers) drawn left→right.
+struct Bar {
+    surface: WlSurface,
+    shell: RiverShellSurfaceV1,
+    node: RiverNodeV1,
+    /// Edge the bar is pinned to (full-width on its monitor, minus margins).
+    anchor: DockAnchor,
+    height: i32,
+    /// Inset from the monitor edges (tint2's `panel_margin`): `margin_x` shrinks
+    /// the width on both sides, `margin_y` offsets from the anchored edge — lets
+    /// the bar "float" instead of running flush to the screen edges.
+    margin_x: i32,
+    margin_y: i32,
+    /// Background fill (r, g, b, a).
+    bg: (u8, u8, u8, u8),
+    /// Default text colour and font size for modules that don't override them.
+    fg: (u8, u8, u8, u8),
+    font_size: f32,
+    /// Modules in left→right order; a `Spacer` pushes the rest to the right.
+    modules: Vec<BarModule>,
+    /// Current shm buffer + its backing file. The contents change every frame,
+    /// so it's rebuilt each render; the previous one is retired a frame later
+    /// (`old`) to give the compositor time to release it before we drop it.
+    buffer: Option<WlBuffer>,
+    backing: Option<std::fs::File>,
+    old: Option<(WlBuffer, std::fs::File)>,
+    /// Surface-local x-ranges recorded on the last render, so a wl_pointer button
+    /// press over the bar can be routed to the executor / tray icon under it.
+    hit: Vec<HitZone>,
+    /// Global position of the bar's top-left (buffer origin) from the last render;
+    /// added to a hit zone's local x to give screen coords for tray Activate/menu.
+    origin: (i32, i32),
+}
+
+/// A clickable region of the bar (surface-local x-range) and what it triggers.
+struct HitZone {
+    x0: i32,
+    x1: i32,
+    kind: HitKind,
+}
+
+/// What clicking a [`HitZone`] does.
+enum HitKind {
+    /// An executor module (id) — runs its `lclick`/`rclick` shell command.
+    Exec(u64),
+    /// A tray icon (item key) — Activate / SecondaryActivate / ContextMenu.
+    Tray(String),
+}
+
+/// How a separator is drawn (tint2's separator styles).
+#[derive(Clone, Copy)]
+enum SepStyle {
+    /// A thin vertical rule (the default).
+    Line,
+    /// Nothing drawn — just `size` px of empty space (invisible separator).
+    Empty,
+    /// A small centred dot.
+    Dot,
+}
+
+/// One item in the status bar.
+enum BarModule {
+    /// Runs a shell command and shows its stdout (tint2's `execp`).
+    Executor(Executor),
+    /// A `size`-px-wide gap, optionally with a rule/dot drawn in `color`.
+    Separator {
+        size: i32,
+        color: (u8, u8, u8, u8),
+        style: SepStyle,
+    },
+    /// Flexible gap: absorbs leftover width so following modules right-align.
+    Spacer,
+    /// System-tray slot: renders the SNI tray icons (`State::tray_items`) inline,
+    /// each `size`×`size` px with `spacing` px between. `size` 0 = auto (bar height).
+    Tray { size: i32, spacing: i32 },
+}
+
+/// How a wallpaper image is fitted to its monitor (nitrogen's modes).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WallMode {
+    /// Scale to cover the monitor, crop-centre the overflow.
+    Fill,
+    /// Scale to fit inside the monitor, letterbox the rest.
+    Fit,
+    /// Scale to the exact monitor size (ignore aspect ratio).
+    Stretch,
+    /// No scaling; centre the image (crop/letterbox as needed).
+    Center,
+    /// Repeat the image to fill the monitor.
+    Tile,
+}
+
+/// What a wallpaper draws: a flat colour or an image fitted by `WallMode`.
+#[derive(Clone)]
+enum WallpaperContent {
+    Color((u8, u8, u8, u8)),
+    Image {
+        path: std::path::PathBuf,
+        mode: WallMode,
+    },
+}
+
+/// A WM-owned wallpaper for one monitor: a `river_shell_surface_v1` placed at the
+/// very bottom of the render list (below all windows), drawn by sfwm into a
+/// `wl_shm` buffer — sfwm's own background, since external tools (swaybg) can't
+/// composite under it. Mirrors `Bar`, but its contents are static, so the
+/// (expensive) decode + scale only runs when the size or content changes
+/// (`last_sig`); other frames just re-place the node.
+struct Wallpaper {
+    surface: WlSurface,
+    shell: RiverShellSurfaceV1,
+    node: RiverNodeV1,
+    content: WallpaperContent,
+    buffer: Option<WlBuffer>,
+    backing: Option<std::fs::File>,
+    old: Option<(WlBuffer, std::fs::File)>,
+    /// (width, height, content-hash) of the last buffer built.
+    last_sig: Option<(i32, i32, u64)>,
+}
+
+/// A notification popup: one `river_shell_surface_v1`, top-right, drawn by sfwm.
+/// Its contents are fixed once shown, so the buffer is built lazily exactly once;
+/// only its position changes as popups above it expire.
+struct Notification {
+    id: u32,
+    summary: String,
+    body: String,
+    /// 0 low, 1 normal, 2 critical (freedesktop urgency hint).
+    urgency: u8,
+    surface: WlSurface,
+    shell: RiverShellSurfaceV1,
+    node: RiverNodeV1,
+    buffer: Option<WlBuffer>,
+    backing: Option<std::fs::File>,
+    /// Pixel height of the drawn popup (computed from the wrapped text).
+    height: i32,
+}
+
+/// Themeable look of notification popups (set via `sc set notify_*`).
+#[derive(Clone, Copy)]
+struct NotifTheme {
+    bg: (u8, u8, u8, u8),
+    fg: (u8, u8, u8, u8),
+    body_fg: (u8, u8, u8, u8),
+    accent: (u8, u8, u8, u8),
+    accent_critical: (u8, u8, u8, u8),
+    width: i32,
+    /// Default expiry (ms) applied when a notification requests -1; 0 = sticky.
+    timeout_ms: i32,
+}
+
+impl Default for NotifTheme {
+    fn default() -> Self {
+        NotifTheme {
+            bg: (0x1d, 0x25, 0x2b, 0xff),
+            fg: (0xf7, 0xf8, 0xf3, 0xff),
+            body_fg: (0xc9, 0xcc, 0xc4, 0xff),
+            accent: (0x4e, 0x9b, 0xcf, 0xff),
+            accent_critical: (0xff, 0x4d, 0x65, 0xff),
+            width: 380,
+            timeout_ms: 5000,
+        }
+    }
+}
+
+/// Themeable look of the launcher overlay (set via `sc set launcher_*`).
+#[derive(Clone, Copy)]
+struct LauncherTheme {
+    /// Fullscreen backdrop; its alpha controls the see-through dim (`#rrggbbaa`).
+    dim: (u8, u8, u8, u8),
+    /// Search box + result-row background.
+    bg: (u8, u8, u8, u8),
+    /// Query text + unselected item text (and the cursor).
+    fg: (u8, u8, u8, u8),
+    /// Selected row background / text.
+    sel_bg: (u8, u8, u8, u8),
+    sel_fg: (u8, u8, u8, u8),
+    /// Maximum panel width in px.
+    width: i32,
+}
+
+impl Default for LauncherTheme {
+    fn default() -> Self {
+        LauncherTheme {
+            dim: (0x0a, 0x0c, 0x0f, 0xc8),
+            bg: (0x1d, 0x25, 0x2b, 0xff),
+            fg: (0xf7, 0xf8, 0xf3, 0xff),
+            sel_bg: (0x4e, 0x9b, 0xcf, 0xff),
+            sel_fg: (0xff, 0xff, 0xff, 0xff),
+            width: 760,
+        }
+    }
+}
+
+/// What the launcher does when a row is chosen.
+enum LauncherAction {
+    /// drun: launch the app whose Exec command is `execs[i]` (parallel to entries).
+    Apps(Vec<String>),
+    /// dmenu (`sc menu`): write the chosen entry back to this client (Esc → empty).
+    Menu(UnixStream),
+}
+
+/// The fullscreen fuzzy launcher: one translucent `river_shell_surface_v1`
+/// covering the focused monitor, keyboard-focused via `focus_shell_surface`.
+/// sfwm draws it (KISS/instant, no external process). Backs both the app launcher
+/// (`sc launcher`) and dmenu (`sc menu`).
+struct Launcher {
+    surface: WlSurface,
+    shell: RiverShellSurfaceV1,
+    node: RiverNodeV1,
+    buffer: Option<WlBuffer>,
+    backing: Option<std::fs::File>,
+    old: Option<(WlBuffer, std::fs::File)>,
+    /// The current search text.
+    query: String,
+    /// The full item list (display text).
+    entries: Vec<String>,
+    /// What Enter does with the chosen entry.
+    action: LauncherAction,
+    /// Indices into `entries`, best match first.
+    matches: Vec<usize>,
+    /// Highlighted row (index into `matches`).
+    selected: usize,
+    /// First visible row (scroll offset into `matches`).
+    scroll: usize,
+    /// Hash of (size, query, selected, scroll) so we only re-rasterize on change.
+    last_sig: Option<u64>,
+}
+
+/// How often an executor's command is run.
+#[derive(Clone, Copy)]
+enum ExecMode {
+    /// Re-run every N seconds (N == 0 means run exactly once).
+    Interval(u64),
+    /// A long-running command; each line it prints becomes the displayed text.
+    Continuous,
+}
+
+/// A status-bar executor: a shell command whose stdout is displayed, refreshed
+/// on an interval or streamed continuously. The command runs on a worker thread
+/// and sends its output back over `State::bar_tx`, so a slow command (e.g. a
+/// `curl` weather fetch) never blocks the WM.
+struct Executor {
+    id: u64,
+    fg: Option<(u8, u8, u8, u8)>,
+    bg: Option<(u8, u8, u8, u8)>,
+    pad: i32,
+    /// Per-module font family (tint2's `execp_font`). Needed for icon fonts
+    /// (Font Awesome / Weather Icons) whose Private-Use-Area glyphs cosmic-text's
+    /// automatic fallback won't reach — name the font explicitly here.
+    family: Option<String>,
+    /// Per-module font size in px; falls back to the bar default when None.
+    size: Option<f32>,
+    /// Click actions (run via `sh -c`); stored now, pointer-routing wired later.
+    #[allow(dead_code)]
+    lclick: Option<String>,
+    #[allow(dead_code)]
+    rclick: Option<String>,
+    /// Most recent output line/blob to display.
+    text: String,
+    /// Set true to tell the worker thread to stop (on `bar clear`/recreate).
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The running child (continuous mode) so it can be killed on teardown.
+    child: Option<std::process::Child>,
 }
 
 impl Window {
@@ -133,6 +414,7 @@ impl Window {
             raise_seq: 0,
             rules_applied: false,
             urgent: false,
+            dock: None,
             dim: None,
         }
     }
@@ -143,7 +425,21 @@ impl Window {
 enum Layer {
     Tiled,
     Floating,
+    /// Docks (status bars) render above tiled/floating windows but below
+    /// fullscreen, matching how a fullscreen window covers a panel in hlwm.
+    Dock,
     Fullscreen,
+}
+
+/// Which edge a dock window (status bar) is pinned to. A dock spans its
+/// monitor's full width and is sticky (shown on every tag), unfocusable, and
+/// untiled — the Wayland analog of hlwm's `manage=off` dock windows. Since
+/// river's WM protocol exposes no X11 `_NET_WM_WINDOW_TYPE=DOCK` hint, docks are
+/// designated by an `app_id`/class rule (e.g. `rule class=tint2 dock=top`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DockAnchor {
+    Top,
+    Bottom,
 }
 
 /// A window rule: match on app_id/title, apply consequences to new windows.
@@ -160,6 +456,8 @@ struct Rule {
     focus: Option<bool>,
     /// Switch the focused monitor to the window's tag (follow it).
     switchtag: Option<bool>,
+    /// Designate the window a dock (status bar) pinned to this edge.
+    dock: Option<DockAnchor>,
 }
 
 /// What applying the rules to a window decided (consumed by `reapply_rules`).
@@ -196,6 +494,11 @@ impl Rule {
         }
         if self.switchtag == Some(true) {
             p.push("switchtag=on".into());
+        }
+        match self.dock {
+            Some(DockAnchor::Top) => p.push("dock=top".into()),
+            Some(DockAnchor::Bottom) => p.push("dock=bottom".into()),
+            None => {}
         }
         p.join(" ")
     }
@@ -324,8 +627,57 @@ struct State {
     spb: Option<WpSinglePixelBufferManagerV1>,
     /// Shared 1x1 premultiplied-black buffer at the configured alpha.
     dim_buffer: Option<WlBuffer>,
+    /// Shared-memory global, for drawing the status bar (and later overlays).
+    shm: Option<WlShm>,
+    /// The WM-drawn status bar, once `sc bar create` has made it.
+    bar: Option<Bar>,
+    /// Per-monitor wallpapers (`sc wallpaper`), keyed by monitor index.
+    wallpapers: HashMap<usize, Wallpaper>,
+    /// calloop handle, stored so bar executors can be (de)registered after the
+    /// loop is built. Set in `run()` once the loop exists.
+    loop_handle: Option<calloop::LoopHandle<'static, State>>,
+    /// Executor worker threads send `(module_id, text)` here; the channel source
+    /// updates the module and triggers a redraw on the main thread.
+    bar_tx: Option<calloop::channel::Sender<(u64, String)>>,
+    /// Text shaping/rasterization state for the bar (lazily built on first draw).
+    font_system: Option<cosmic_text::FontSystem>,
+    swash_cache: Option<cosmic_text::SwashCache>,
+    /// Monotonic id handed to each new bar executor.
+    next_bar_module: u64,
     /// Dim strength for unfocused windows, 0.0 (off) ..= 1.0 (hlwm-ish setting).
     inactive_dim: f64,
+    /// Active notification popups (most-recent last), each its own shell surface.
+    notifications: Vec<Notification>,
+    /// Notification look (colours/width/timeout), set via `sc set notify_*`.
+    notif_theme: NotifTheme,
+    /// A `wl_keyboard` (bound via `wl_seat`) — only used to drive the launcher,
+    /// which is the one WM-owned surface that takes keyboard focus.
+    wl_keyboard: Option<WlKeyboard>,
+    /// xkb state for turning keycodes into text/keysyms while the launcher is open.
+    xkb_state: Option<xkbcommon::xkb::State>,
+    /// The fullscreen fuzzy launcher, while open.
+    launcher: Option<Launcher>,
+    /// Launcher look (colours/dim/width), set via `sc set launcher_*`.
+    launcher_theme: LauncherTheme,
+    /// Cached `.desktop` apps (loaded on first launcher open).
+    apps: Vec<launcher::DesktopApp>,
+    /// SNI system-tray items (from the tray D-Bus thread), in stable insertion
+    /// order; drawn by a `BarModule::Tray` slot.
+    tray_items: Vec<tray::TrayItem>,
+    /// Sends click/scroll commands to the tray thread; None until the tray starts.
+    tray_cmd: Option<std::sync::mpsc::Sender<tray::TrayCmd>>,
+    /// The `wl_pointer` (bound via `wl_seat`) — drives bar/tray click routing.
+    /// sfwm's shell surfaces receive wl_pointer directly (river protocol), so this
+    /// is how bar executors and tray icons get their clicks.
+    wl_pointer: Option<WlPointer>,
+    /// True while the pointer is over the bar's surface (wl_pointer Enter/Leave).
+    pointer_over_bar: bool,
+    /// Latest surface-local pointer position over the bar (wl_pointer Enter/Motion).
+    bar_pointer: (i32, i32),
+    /// Last pointer button pressed (evdev code), so the `shell_surface_interaction`
+    /// fallback can route with the correct button when wl_pointer focus isn't
+    /// delivered to our shell surface. Defaults to BTN_LEFT.
+    last_pointer_button: u32,
 }
 
 impl State {
@@ -477,7 +829,13 @@ impl State {
                     (usable.h - 2 * gap).max(0),
                 );
                 for p in tree.placements(area, gap) {
-                    if self.windows.get(&p.win).map_or(false, |w| w.floating) {
+                    // Floating windows and docks are rendered separately, not
+                    // from the frame tree.
+                    if self
+                        .windows
+                        .get(&p.win)
+                        .map_or(false, |w| w.floating || w.dock.is_some())
+                    {
                         continue;
                     }
                     if !claimed.insert(p.win) {
@@ -511,6 +869,46 @@ impl State {
             }
 
             per_mon.insert(mi, items);
+        }
+
+        // Dock windows (status bars): sticky across tags, full-width pinned to
+        // their anchor edge, on their home monitor. Resolved by containment of
+        // the parked origin so a dock stays put as tags switch underneath it.
+        for (wid, w) in &self.windows {
+            let Some(anchor) = w.dock else { continue };
+            if !claimed.insert(*wid) {
+                continue;
+            }
+            let (px, py) = (w.float_geo.x, w.float_geo.y);
+            let mi = self
+                .monitors
+                .list
+                .iter()
+                .position(|m| {
+                    px >= m.rect.x
+                        && px < m.rect.x + m.rect.w
+                        && py >= m.rect.y
+                        && py < m.rect.y + m.rect.h
+                })
+                .filter(|&i| per_mon.contains_key(&i))
+                .or_else(|| per_mon.keys().min().copied());
+            let Some(mi) = mi else { continue };
+            let m = &self.monitors.list[mi];
+            let want_h = if w.dims.1 > 0 { w.dims.1 } else { 28 };
+            let h = want_h.min(m.rect.h.max(1));
+            let y = match anchor {
+                DockAnchor::Top => m.rect.y,
+                DockAnchor::Bottom => m.rect.y + m.rect.h - h,
+            };
+            let rect = Rect::new(m.rect.x, y, m.rect.w, h);
+            per_mon.entry(mi).or_default().push(RenderItem {
+                mon: mi,
+                win: *wid,
+                rect,
+                visible: true,
+                layer: Layer::Dock,
+                seq: w.raise_seq,
+            });
         }
 
         // Emit bottom → top; within a monitor, low layer first, then by the
@@ -581,6 +979,7 @@ impl State {
         let mut want_pseudotile = None;
         let mut want_focus = false;
         let mut want_switchtag = false;
+        let mut want_dock = None;
         for r in &self.rules {
             if let Some((exact, pat)) = &r.app_id {
                 if !match_field(app_id.as_deref(), *exact, pat) {
@@ -613,6 +1012,9 @@ impl State {
             if let Some(s) = r.switchtag {
                 want_switchtag = s;
             }
+            if let Some(d) = r.dock {
+                want_dock = Some(d);
+            }
         }
         if let Some(w) = self.windows.get_mut(&wid) {
             w.tag = tag;
@@ -622,6 +1024,11 @@ impl State {
             if let Some(p) = want_pseudotile {
                 w.pseudotile = p;
             }
+            w.dock = want_dock;
+        }
+        // A dock never steals focus.
+        if want_dock.is_some() {
+            want_focus = false;
         }
         RuleOutcome { tag, focus: want_focus, switchtag: want_switchtag }
     }
@@ -651,6 +1058,9 @@ impl State {
         if floating {
             let geo = self.default_float_geo();
             self.make_floating(wid, geo);
+        }
+        if let Some(anchor) = self.windows.get(&wid).and_then(|w| w.dock) {
+            self.make_dock(wid, anchor);
         }
         // switchtag: pull the window's tag onto the focused monitor (follow it).
         if outcome.switchtag {
@@ -748,6 +1158,28 @@ impl State {
                 self.next_raise += 1;
             }
         }
+    }
+
+    /// Designate `wid` a dock pinned to `anchor`: sticky, unfocusable, untiled,
+    /// full-width on its monitor. The exact rect (edge, width, height) is derived
+    /// each layout pass from the live monitor geometry; here we only record the
+    /// anchor, a stacking key, and a home position (the focused monitor's origin)
+    /// so the layout pass can resolve which output it belongs to.
+    fn make_dock(&mut self, wid: WinId, anchor: DockAnchor) {
+        let seq = self.next_raise;
+        let origin = self
+            .monitors
+            .list
+            .get(self.monitors.focus)
+            .map(|m| (m.rect.x, m.rect.y))
+            .unwrap_or((0, 0));
+        if let Some(w) = self.windows.get_mut(&wid) {
+            w.dock = Some(anchor);
+            w.floating = false;
+            w.raise_seq = seq;
+            w.float_geo = Rect::new(origin.0, origin.1, 0, 0);
+        }
+        self.next_raise += 1;
     }
 
     /// Raise (`to_top` true) or lower the focused window in the float stack.
@@ -856,7 +1288,7 @@ impl State {
                     w.win.set_tiled(river_window_v1::Edges::empty());
                 } else {
                     w.win.propose_dimensions(rect.w, rect.h);
-                    let edges = if w.floating {
+                    let edges = if w.floating || w.dock.is_some() {
                         river_window_v1::Edges::empty()
                     } else {
                         tiled_edges(rect, usable)
@@ -879,15 +1311,18 @@ impl State {
             }
         }
 
-        // Keyboard focus follows the focused monitor's focused window.
+        // Keyboard focus: the launcher grabs it while open, otherwise it follows
+        // the focused monitor's focused window.
+        let launcher_shell = self.launcher.as_ref().map(|l| l.shell.clone());
         let focus_win = self
             .focused_window()
             .and_then(|wid| self.windows.get(&wid))
             .map(|w| w.win.clone());
         for seat in &self.seats {
-            match &focus_win {
-                Some(w) => seat.focus_window(w),
-                None => seat.clear_focus(),
+            match (&launcher_shell, &focus_win) {
+                (Some(shell), _) => seat.focus_shell_surface(shell),
+                (None, Some(w)) => seat.focus_window(w),
+                (None, None) => seat.clear_focus(),
             }
         }
     }
@@ -955,7 +1390,7 @@ impl State {
             w.win.show();
             let lone = item.layer == Layer::Tiled
                 && tiled_per_mon.get(&item.mon).copied() == Some(1);
-            if bw > 0 && item.layer != Layer::Fullscreen && !lone {
+            if bw > 0 && item.layer != Layer::Fullscreen && item.layer != Layer::Dock && !lone {
                 let c = if Some(item.win) == focused {
                     active
                 } else if w.urgent {
@@ -977,15 +1412,1006 @@ impl State {
             }
         }
 
-        // Enforce the exact bottom → top order.
-        if let Some(first) = ordered_nodes.first() {
+        // Draw the per-monitor wallpapers (bottom-most), then enforce the exact
+        // bottom → top order: [wallpapers, windows, bar].
+        let wp_nodes = self.render_wallpaper(qh);
+        let mut stack = wp_nodes;
+        stack.extend(ordered_nodes);
+        if let Some(first) = stack.first() {
             first.place_bottom();
         }
-        for pair in ordered_nodes.windows(2) {
+        for pair in stack.windows(2) {
             pair[1].place_above(&pair[0]);
         }
 
+        // Draw + place the WM-owned status bar above everything.
+        let top_node = stack.last().cloned();
+        self.render_bar(qh, top_node.as_ref());
+
         self.apply_dim(qh, &layout, focused);
+
+        // Notification popups sit on top of everything (placed last)...
+        self.render_notifications(qh);
+        // ...except the launcher overlay, which is the very topmost when open.
+        self.render_launcher(qh);
+    }
+
+    /// Draw and place the status bar, inside the render sequence. Rebuilds the
+    /// shm buffer only when the size changes; always re-syncs + commits so the
+    /// surface lands atomically with `render_finish` (protocol requirement).
+    /// `top_node` is the topmost window node, so the bar sits above all windows.
+    fn render_bar(&mut self, qh: &QueueHandle<Self>, top_node: Option<&RiverNodeV1>) {
+        let Some(shm) = self.shm.clone() else { return };
+        let Some(rect) = self.monitors.list.first().map(|m| m.rect) else { return };
+        if self.bar.is_none() {
+            return;
+        }
+        // Build the (expensive) font system once, on first draw.
+        if self.font_system.is_none() {
+            self.font_system = Some(cosmic_text::FontSystem::new());
+            self.swash_cache = Some(cosmic_text::SwashCache::new());
+        }
+        // Take the font state out so we can borrow self.bar mutably alongside it.
+        let mut fs = self.font_system.take().unwrap();
+        let mut sc = self.swash_cache.take().unwrap();
+        let bar = self.bar.as_mut().unwrap();
+
+        let h = bar.height.max(1);
+        let w = (rect.w - 2 * bar.margin_x).max(1);
+        let x = rect.x + bar.margin_x;
+        let y = match bar.anchor {
+            DockAnchor::Top => rect.y + bar.margin_y,
+            DockAnchor::Bottom => rect.y + rect.h - h - bar.margin_y,
+        };
+        bar.origin = (x, y);
+        let font_size = bar.font_size;
+        // Render every item, including SNI "Passive" ones — many apps (appindicator,
+        // nm-applet) sit in Passive and would otherwise never show.
+        let tray_count = self.tray_items.len() as i32;
+
+        // --- draw the modules into a fresh BGRA buffer ---
+        let mut data = vec![0u8; w as usize * h as usize * 4];
+        fill_rect(&mut data, w, h, 0, 0, w, h, bar.bg);
+
+        // Measure each module's width; spacers take the leftover.
+        let mut widths: Vec<i32> = Vec::with_capacity(bar.modules.len());
+        let mut fixed = 0i32;
+        let mut spacers = 0i32;
+        for m in &bar.modules {
+            let wd = match m {
+                BarModule::Separator { size, .. } => *size,
+                BarModule::Spacer => {
+                    spacers += 1;
+                    0
+                }
+                BarModule::Executor(e) => {
+                    measure_text(&mut fs, &e.text, e.size.unwrap_or(font_size), e.family.as_deref())
+                        + 2 * e.pad
+                }
+                BarModule::Tray { size, spacing } => {
+                    let isize = if *size > 0 { *size } else { (h - 8).max(8) };
+                    tray_count * (isize + spacing)
+                }
+            };
+            if !matches!(m, BarModule::Spacer) {
+                fixed += wd;
+            }
+            widths.push(wd);
+        }
+        let leftover = (w - fixed).max(0);
+        let spacer_w = if spacers > 0 { leftover / spacers } else { 0 };
+
+        let mut cx = 0i32;
+        // Click zones recorded during the draw, assigned to bar.hit afterwards
+        // (can't borrow bar.hit mutably while iterating bar.modules).
+        let mut hits: Vec<HitZone> = Vec::new();
+        for (m, wd) in bar.modules.iter().zip(widths.iter()) {
+            match m {
+                BarModule::Spacer => cx += spacer_w,
+                BarModule::Separator { size, color, style } => {
+                    match style {
+                        SepStyle::Line => {
+                            fill_rect(&mut data, w, h, cx + size / 2, h / 4, 1, (h / 2).max(1), *color);
+                        }
+                        SepStyle::Dot => {
+                            fill_rect(&mut data, w, h, cx + size / 2 - 1, h / 2 - 1, 2, 2, *color);
+                        }
+                        SepStyle::Empty => {} // invisible: just the gap
+                    }
+                    cx += size;
+                }
+                BarModule::Executor(e) => {
+                    if let Some(bg) = e.bg {
+                        fill_rect(&mut data, w, h, cx, 0, *wd, h, bg);
+                    }
+                    let color = e.fg.unwrap_or(bar.fg);
+                    let sz = e.size.unwrap_or(font_size);
+                    let pen_y = ((h - sz as i32) / 2).max(0);
+                    draw_text(
+                        &mut data, w, h, cx + e.pad, pen_y, &e.text, sz, color,
+                        e.family.as_deref(), &mut fs, &mut sc,
+                    );
+                    if e.lclick.is_some() || e.rclick.is_some() {
+                        hits.push(HitZone { x0: cx, x1: cx + *wd, kind: HitKind::Exec(e.id) });
+                    }
+                    cx += *wd;
+                }
+                BarModule::Tray { size, spacing } => {
+                    let isize = if *size > 0 { *size } else { (h - 8).max(8) };
+                    let iy = ((h - isize) / 2).max(0);
+                    for item in &self.tray_items {
+                        match &item.icon {
+                            Some(icon) => draw_icon(&mut data, w, h, cx, iy, isize, icon),
+                            // No icon resolved: draw a visible placeholder (accent box
+                            // + the title's first letter) so the item isn't invisible.
+                            None => {
+                                fill_rect(&mut data, w, h, cx, iy, isize, isize, (0x4e, 0x9b, 0xcf, 0xff));
+                                let ch = item
+                                    .title
+                                    .chars()
+                                    .find(|c| c.is_alphanumeric())
+                                    .unwrap_or('?')
+                                    .to_uppercase()
+                                    .to_string();
+                                let lsz = (isize as f32 * 0.6).max(8.0);
+                                let lw = measure_text(&mut fs, &ch, lsz, None);
+                                draw_text(
+                                    &mut data, w, h, cx + (isize - lw) / 2,
+                                    iy + ((isize - lsz as i32) / 2).max(0), &ch, lsz,
+                                    (0xff, 0xff, 0xff, 0xff), None, &mut fs, &mut sc,
+                                );
+                            }
+                        }
+                        hits.push(HitZone {
+                            x0: cx,
+                            x1: cx + isize + spacing,
+                            kind: HitKind::Tray(item.key.clone()),
+                        });
+                        cx += isize + spacing;
+                    }
+                }
+            }
+        }
+        bar.hit = hits;
+
+        // Upload as a fresh shm buffer; retire the buffer that's now two frames
+        // old (the compositor has had time to release it).
+        if let Some((b, _f)) = bar.old.take() {
+            b.destroy();
+        }
+        bar.old = match (bar.buffer.take(), bar.backing.take()) {
+            (Some(b), Some(f)) => Some((b, f)),
+            _ => None,
+        };
+        match shm_file(&data) {
+            Ok(file) => {
+                let pool = shm.create_pool(file.as_fd(), data.len() as i32, qh, ());
+                let buffer = pool.create_buffer(0, w, h, w * 4, wl_shm::Format::Argb8888, qh, ());
+                pool.destroy();
+                bar.buffer = Some(buffer);
+                bar.backing = Some(file);
+            }
+            Err(e) => {
+                eprintln!("sfwm: bar: shm buffer failed: {e}");
+                return; // font_system left None → rebuilt next frame (rare path)
+            }
+        }
+
+        // Commit synced to render_finish (protocol: sync_next_commit, then commit
+        // the surface, both before render_finish).
+        bar.shell.sync_next_commit();
+        if let Some(buf) = &bar.buffer {
+            bar.surface.attach(Some(buf), 0, 0);
+            bar.surface.damage_buffer(0, 0, w, h);
+        }
+        bar.surface.commit();
+        bar.node.set_position(x, y);
+        match top_node {
+            Some(n) => bar.node.place_above(n),
+            None => bar.node.place_top(),
+        }
+
+        self.font_system = Some(fs);
+        self.swash_cache = Some(sc);
+    }
+
+    /// Route a pointer button press over the bar (at surface-local x `lx`) to
+    /// whatever module is under the cursor: an executor's `lclick`/`rclick` shell
+    /// command, or a tray icon's SNI action (left = Activate, middle =
+    /// SecondaryActivate, right = ContextMenu).
+    fn bar_click(&mut self, lx: i32, button: u32) {
+        const BTN_RIGHT: u32 = 0x111;
+        const BTN_MIDDLE: u32 = 0x112;
+        let Some(bar) = self.bar.as_ref() else { return };
+        let (origin, height) = (bar.origin, bar.height);
+        let Some(zone) = bar.hit.iter().find(|z| lx >= z.x0 && lx < z.x1) else {
+            eprintln!("sfwm: bar: click at x={lx} hit no module ({} zones)", bar.hit.len());
+            return;
+        };
+        eprintln!("sfwm: bar: click x={lx} button={button} → zone {}..{}", zone.x0, zone.x1);
+        let zx0 = zone.x0;
+        let kind = match &zone.kind {
+            HitKind::Exec(id) => HitKind::Exec(*id),
+            HitKind::Tray(k) => HitKind::Tray(k.clone()),
+        };
+        match kind {
+            HitKind::Exec(id) => {
+                let cmd = bar.modules.iter().find_map(|m| match m {
+                    BarModule::Executor(e) if e.id == id => {
+                        if button == BTN_RIGHT {
+                            e.rclick.clone()
+                        } else {
+                            e.lclick.clone()
+                        }
+                    }
+                    _ => None,
+                });
+                if let Some(cmd) = cmd {
+                    let _ = std::process::Command::new("sh").arg("-c").arg(cmd).spawn();
+                }
+            }
+            HitKind::Tray(key) => {
+                let Some(tx) = self.tray_cmd.as_ref() else { return };
+                // Menu-only items (ItemIsMenu) have no useful Activate — left-click
+                // should raise their menu, same as a right-click.
+                let is_menu = self
+                    .tray_items
+                    .iter()
+                    .find(|i| i.key == key)
+                    .is_some_and(|i| i.is_menu);
+                // The icon's screen position anchors the item's menu (SNI convention).
+                let (x, y) = (origin.0 + zx0, origin.1 + height);
+                let cmd = match button {
+                    BTN_RIGHT => tray::TrayCmd::ContextMenu { key, x, y },
+                    BTN_MIDDLE => tray::TrayCmd::SecondaryActivate { key, x, y },
+                    _ if is_menu => tray::TrayCmd::ContextMenu { key, x, y },
+                    _ => tray::TrayCmd::Activate { key, x, y }, // BTN_LEFT
+                };
+                let _ = tx.send(cmd);
+            }
+        }
+    }
+
+    /// Route a scroll over the bar to the tray icon under the cursor (SNI `Scroll`).
+    fn bar_scroll(&mut self, axis: wl_pointer::Axis, value: f64) {
+        if value == 0.0 {
+            return;
+        }
+        let lx = self.bar_pointer.0;
+        let key = self.bar.as_ref().and_then(|bar| {
+            bar.hit.iter().find(|z| lx >= z.x0 && lx < z.x1).and_then(|z| match &z.kind {
+                HitKind::Tray(k) => Some(k.clone()),
+                _ => None,
+            })
+        });
+        if let (Some(key), Some(tx)) = (key, self.tray_cmd.as_ref()) {
+            let horizontal = matches!(axis, wl_pointer::Axis::HorizontalScroll);
+            // SNI Scroll wants a small integer delta; sign follows the scroll direction.
+            let delta = if value > 0.0 { 1 } else { -1 };
+            let _ = tx.send(tray::TrayCmd::Scroll { key, delta, horizontal });
+        }
+    }
+
+    /// Apply a tray item add/change/remove from the D-Bus thread, then redraw.
+    fn handle_tray_event(&mut self, ev: tray::TrayEvent) {
+        match ev {
+            tray::TrayEvent::Upsert(item) => {
+                if let Some(existing) = self.tray_items.iter_mut().find(|i| i.key == item.key) {
+                    *existing = item;
+                } else {
+                    self.tray_items.push(item);
+                }
+            }
+            tray::TrayEvent::Remove(key) => self.tray_items.retain(|i| i.key != key),
+        }
+        self.request_manage();
+    }
+
+    /// Update an executor module's displayed text (from its worker thread, via
+    /// the bar channel) and trigger a redraw.
+    fn set_bar_module_text(&mut self, id: u64, text: String) {
+        let mut found = false;
+        if let Some(bar) = self.bar.as_mut() {
+            for m in &mut bar.modules {
+                if let BarModule::Executor(e) = m {
+                    if e.id == id {
+                        e.text = text;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if found {
+            self.request_manage();
+        }
+    }
+
+    /// Start a bar executor's worker thread. It runs the command off the main
+    /// thread and pushes output over `bar_tx`, so a slow command never blocks the
+    /// WM. Returns the child (continuous mode) so teardown can kill it.
+    fn spawn_executor(
+        &self,
+        id: u64,
+        cmd: String,
+        mode: ExecMode,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<std::process::Child> {
+        use std::process::{Command, Stdio};
+        use std::sync::atomic::Ordering;
+        let tx = self.bar_tx.clone()?;
+        match mode {
+            ExecMode::Continuous => match Command::new("sh")
+                .arg("-c")
+                .arg(&cmd)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    if let Some(out) = child.stdout.take() {
+                        std::thread::spawn(move || {
+                            use std::io::BufRead;
+                            for line in std::io::BufReader::new(out).lines() {
+                                match line {
+                                    Ok(l) => {
+                                        if tx.send((id, l)).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                        });
+                    }
+                    Some(child)
+                }
+                Err(e) => {
+                    eprintln!("sfwm: bar executor spawn failed: {e}");
+                    None
+                }
+            },
+            ExecMode::Interval(secs) => {
+                std::thread::spawn(move || loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if let Ok(out) = Command::new("sh")
+                        .arg("-c")
+                        .arg(&cmd)
+                        .stdin(Stdio::null())
+                        .output()
+                    {
+                        let text = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+                        if tx.send((id, text)).is_err() {
+                            break;
+                        }
+                    }
+                    if secs == 0 {
+                        break; // run-once
+                    }
+                    for _ in 0..secs {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    }
+                });
+                None
+            }
+        }
+    }
+
+    /// Stop every bar executor (kill children / signal threads) and drop modules.
+    fn teardown_bar_modules(&mut self) {
+        if let Some(bar) = self.bar.as_mut() {
+            for m in &mut bar.modules {
+                if let BarModule::Executor(e) = m {
+                    e.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(child) = e.child.as_mut() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                }
+            }
+            bar.modules.clear();
+        }
+    }
+
+    /// Fully remove the bar: stop its executors AND destroy its Wayland objects
+    /// (node, shell surface, surface, buffers). Wayland proxies are NOT freed on
+    /// drop, so without this an `sc bar create` over an existing bar would leak
+    /// the old shell surface/node — river keeps compositing a ghost of it.
+    fn destroy_bar(&mut self) {
+        self.teardown_bar_modules();
+        if let Some(bar) = self.bar.take() {
+            if let Some(b) = bar.buffer {
+                b.destroy();
+            }
+            if let Some((b, _)) = bar.old {
+                b.destroy();
+            }
+            bar.node.destroy();
+            bar.shell.destroy();
+            bar.surface.destroy();
+        }
+    }
+
+    /// Draw each monitor's wallpaper and return their nodes (bottom-most). Rebuilds
+    /// the shm buffer (decode + scale) only when the monitor size or content
+    /// changed; otherwise just re-places the existing surface. Runs inside the
+    /// render sequence (from `do_render`, before `render_finish`).
+    fn render_wallpaper(&mut self, qh: &QueueHandle<Self>) -> Vec<RiverNodeV1> {
+        let mut nodes = Vec::new();
+        if self.wallpapers.is_empty() {
+            return nodes;
+        }
+        let Some(shm) = self.shm.clone() else {
+            return nodes;
+        };
+        // Snapshot monitor rects so we don't borrow self.monitors while mutating
+        // self.wallpapers.
+        let rects: HashMap<usize, Rect> = self
+            .monitors
+            .list
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (i, m.rect))
+            .collect();
+        for (idx, wp) in self.wallpapers.iter_mut() {
+            let Some(rect) = rects.get(idx).copied() else {
+                continue;
+            };
+            let w = rect.w.max(1);
+            let h = rect.h.max(1);
+            let sig = (w, h, content_sig(&wp.content));
+            if wp.last_sig != Some(sig) {
+                let data = render_wallpaper_pixels(&wp.content, w, h);
+                if let Some((b, _)) = wp.old.take() {
+                    b.destroy();
+                }
+                wp.old = match (wp.buffer.take(), wp.backing.take()) {
+                    (Some(b), Some(f)) => Some((b, f)),
+                    _ => None,
+                };
+                match shm_file(&data) {
+                    Ok(file) => {
+                        let pool = shm.create_pool(file.as_fd(), data.len() as i32, qh, ());
+                        let buffer =
+                            pool.create_buffer(0, w, h, w * 4, wl_shm::Format::Argb8888, qh, ());
+                        pool.destroy();
+                        wp.shell.sync_next_commit();
+                        wp.surface.attach(Some(&buffer), 0, 0);
+                        wp.surface.damage_buffer(0, 0, w, h);
+                        wp.surface.commit();
+                        wp.buffer = Some(buffer);
+                        wp.backing = Some(file);
+                        wp.last_sig = Some(sig);
+                    }
+                    Err(e) => {
+                        eprintln!("sfwm: wallpaper: shm buffer failed: {e}");
+                        continue;
+                    }
+                }
+            }
+            wp.node.set_position(rect.x, rect.y);
+            nodes.push(wp.node.clone());
+        }
+        nodes
+    }
+
+    /// Set the wallpaper on each of `mons`. If a monitor already has one, REUSE
+    /// its surface and just swap the content (same reason as the bar: a freshly
+    /// re-created shell surface isn't reliably composited until a full render, so
+    /// destroy+recreate made the wallpaper vanish after `sc reload`). The buffer
+    /// rebuilds on the next render (`last_sig = None`).
+    fn set_wallpaper(&mut self, mons: &[usize], content: WallpaperContent) {
+        let (Some(comp), Some(wm)) = (self.compositor.clone(), self.wm.clone()) else {
+            return;
+        };
+        let qh = self.qh.clone();
+        for &m in mons {
+            if let Some(wp) = self.wallpapers.get_mut(&m) {
+                wp.content = content.clone();
+                wp.last_sig = None; // force a redraw on the reused surface
+            } else {
+                let surface = comp.create_surface(&qh, ());
+                let shell = wm.get_shell_surface(&surface, &qh, ());
+                let node = shell.get_node(&qh, ());
+                self.wallpapers.insert(
+                    m,
+                    Wallpaper {
+                        surface,
+                        shell,
+                        node,
+                        content: content.clone(),
+                        buffer: None,
+                        backing: None,
+                        old: None,
+                        last_sig: None,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Tear down the wallpaper on `mon` (or all monitors when `None`), destroying
+    /// every Wayland object (proxies aren't freed on Drop — same rule as the bar).
+    fn destroy_wallpaper(&mut self, mon: Option<usize>) {
+        let targets: Vec<usize> = match mon {
+            Some(m) => vec![m],
+            None => self.wallpapers.keys().copied().collect(),
+        };
+        for m in targets {
+            if let Some(wp) = self.wallpapers.remove(&m) {
+                if let Some(b) = wp.buffer {
+                    b.destroy();
+                }
+                if let Some((b, _)) = wp.old {
+                    b.destroy();
+                }
+                wp.node.destroy();
+                wp.shell.destroy();
+                wp.surface.destroy();
+            }
+        }
+    }
+
+    /// Handle a notification event from the D-Bus thread (show or close a popup).
+    fn handle_notif_event(&mut self, ev: notify::NotifEvent) {
+        match ev {
+            notify::NotifEvent::Show {
+                id,
+                summary,
+                body,
+                urgency,
+                expire_timeout,
+                ..
+            } => {
+                // replaces_id reuse: drop any existing popup with this id first.
+                self.close_notification(id);
+                let (Some(comp), Some(wm)) = (self.compositor.clone(), self.wm.clone()) else {
+                    return;
+                };
+                let qh = self.qh.clone();
+                let surface = comp.create_surface(&qh, ());
+                let shell = wm.get_shell_surface(&surface, &qh, ());
+                let node = shell.get_node(&qh, ());
+                self.notifications.push(Notification {
+                    id,
+                    summary,
+                    body,
+                    urgency,
+                    surface,
+                    shell,
+                    node,
+                    buffer: None,
+                    backing: None,
+                    height: 0,
+                });
+                // Keep at most 5 on screen; evict the oldest.
+                while self.notifications.len() > 5 {
+                    let old = self.notifications.remove(0);
+                    Self::destroy_notification_objs(old);
+                }
+                // Expiry: -1 = the themed default, 0 = sticky, else the given ms.
+                let ms = if expire_timeout < 0 {
+                    self.notif_theme.timeout_ms.max(0) as u64
+                } else {
+                    expire_timeout as u64
+                };
+                if ms > 0 {
+                    if let Some(h) = self.loop_handle.clone() {
+                        let timer =
+                            calloop::timer::Timer::from_duration(std::time::Duration::from_millis(ms));
+                        let _ = h.insert_source(timer, move |_, _, state: &mut State| {
+                            state.close_notification(id);
+                            calloop::timer::TimeoutAction::Drop
+                        });
+                    }
+                }
+                self.request_manage();
+            }
+            notify::NotifEvent::Close(id) => self.close_notification(id),
+        }
+    }
+
+    /// Remove a popup by id (expiry or explicit CloseNotification) and redraw.
+    fn close_notification(&mut self, id: u32) {
+        if let Some(pos) = self.notifications.iter().position(|n| n.id == id) {
+            let n = self.notifications.remove(pos);
+            Self::destroy_notification_objs(n);
+            self.request_manage();
+        }
+    }
+
+    fn destroy_notification_objs(n: Notification) {
+        if let Some(b) = n.buffer {
+            b.destroy();
+        }
+        n.node.destroy();
+        n.shell.destroy();
+        n.surface.destroy();
+    }
+
+    /// Draw the notification popups, stacked top-right on the focused monitor,
+    /// above the bar. Each popup's buffer is built once (contents are static);
+    /// later frames only re-place it as popups above it expire. Runs inside the
+    /// render sequence (from `do_render`, before `render_finish`).
+    fn render_notifications(&mut self, qh: &QueueHandle<Self>) {
+        if self.notifications.is_empty() {
+            return;
+        }
+        let Some(shm) = self.shm.clone() else {
+            return;
+        };
+        let mon = self
+            .monitors
+            .list
+            .get(self.monitors.focus)
+            .or_else(|| self.monitors.list.first());
+        let Some(rect) = mon.map(|m| m.rect) else {
+            return;
+        };
+        if self.font_system.is_none() {
+            self.font_system = Some(cosmic_text::FontSystem::new());
+            self.swash_cache = Some(cosmic_text::SwashCache::new());
+        }
+        let mut fs = self.font_system.take().unwrap();
+        let mut sc = self.swash_cache.take().unwrap();
+        let theme = self.notif_theme;
+
+        let w_box = theme.width.max(120);
+        const PAD: i32 = 12;
+        const ACCENT: i32 = 4;
+        const MARGIN: i32 = 12;
+        const GAP: i32 = 8;
+        const SUMMARY: f32 = 15.0;
+        const BODY: f32 = 13.0;
+        let wrap_w = (w_box - 2 * PAD - ACCENT) as f32;
+
+        // Build any popup that hasn't been rasterized yet (also sets its height).
+        for n in self.notifications.iter_mut() {
+            if n.buffer.is_some() {
+                continue;
+            }
+            let (_, body_lines) = measure_wrapped(&mut fs, &n.body, BODY, wrap_w);
+            let summary_h = (SUMMARY * 1.35).ceil() as i32;
+            let body_h = if n.body.is_empty() {
+                0
+            } else {
+                (body_lines as f32 * (BODY * 1.35)).ceil() as i32
+            };
+            let gap = if n.body.is_empty() { 0 } else { 6 };
+            let h = (PAD + summary_h + gap + body_h + PAD).max(40);
+
+            let mut data = vec![0u8; w_box as usize * h as usize * 4];
+            fill_rect(&mut data, w_box, h, 0, 0, w_box, h, theme.bg);
+            let accent = if n.urgency == 2 {
+                theme.accent_critical
+            } else {
+                theme.accent
+            };
+            fill_rect(&mut data, w_box, h, 0, 0, ACCENT, h, accent);
+            let tx0 = PAD + ACCENT;
+            draw_text(
+                &mut data, w_box, h, tx0, PAD, &n.summary, SUMMARY, theme.fg, None, &mut fs, &mut sc,
+            );
+            if !n.body.is_empty() {
+                draw_wrapped(
+                    &mut data, w_box, h, tx0, PAD + summary_h + gap, &n.body, BODY,
+                    theme.body_fg, wrap_w, &mut fs, &mut sc,
+                );
+            }
+            match shm_file(&data) {
+                Ok(file) => {
+                    let pool = shm.create_pool(file.as_fd(), data.len() as i32, qh, ());
+                    let buffer = pool.create_buffer(
+                        0, w_box, h, w_box * 4, wl_shm::Format::Argb8888, qh, (),
+                    );
+                    pool.destroy();
+                    n.shell.sync_next_commit();
+                    n.surface.attach(Some(&buffer), 0, 0);
+                    n.surface.damage_buffer(0, 0, w_box, h);
+                    n.surface.commit();
+                    n.buffer = Some(buffer);
+                    n.backing = Some(file);
+                    n.height = h;
+                }
+                Err(e) => eprintln!("sfwm: notification: shm buffer failed: {e}"),
+            }
+        }
+
+        // Stack top-right, below a top-anchored bar.
+        let mut top = MARGIN;
+        if let Some(b) = &self.bar {
+            if matches!(b.anchor, DockAnchor::Top) {
+                top += b.margin_y * 2 + b.height;
+            }
+        }
+        let x = rect.x + rect.w - w_box - MARGIN;
+        let mut y = rect.y + top;
+        for n in self.notifications.iter() {
+            n.node.set_position(x, y);
+            n.node.place_top();
+            y += n.height + GAP;
+        }
+
+        self.font_system = Some(fs);
+        self.swash_cache = Some(sc);
+    }
+
+    /// Open the app launcher (`sc launcher`), or toggle it closed if already open.
+    fn open_launcher(&mut self) {
+        if self.launcher.is_some() {
+            self.close_launcher();
+            return;
+        }
+        if self.apps.is_empty() {
+            self.apps = launcher::enumerate_apps();
+        }
+        let entries: Vec<String> = self.apps.iter().map(|a| a.name.clone()).collect();
+        let execs: Vec<String> = self.apps.iter().map(|a| a.exec.clone()).collect();
+        self.open_launcher_with(entries, LauncherAction::Apps(execs));
+    }
+
+    /// Open the launcher in dmenu mode (`sc menu`): the chosen entry is written
+    /// back to `stream`; Esc/no-match writes nothing (client sees EOF → exit 1).
+    fn open_launcher_menu(&mut self, items: Vec<String>, stream: UnixStream) {
+        self.close_launcher(); // a new menu replaces any open launcher
+        self.open_launcher_with(items, LauncherAction::Menu(stream));
+    }
+
+    fn open_launcher_with(&mut self, entries: Vec<String>, action: LauncherAction) {
+        let (Some(comp), Some(wm)) = (self.compositor.clone(), self.wm.clone()) else {
+            return;
+        };
+        let qh = self.qh.clone();
+        let surface = comp.create_surface(&qh, ());
+        let shell = wm.get_shell_surface(&surface, &qh, ());
+        let node = shell.get_node(&qh, ());
+        let matches = launcher::filter(&entries, "");
+        self.launcher = Some(Launcher {
+            surface,
+            shell,
+            node,
+            buffer: None,
+            backing: None,
+            old: None,
+            query: String::new(),
+            entries,
+            action,
+            matches,
+            selected: 0,
+            scroll: 0,
+            last_sig: None,
+        });
+        self.request_manage();
+    }
+
+    /// Close the launcher with no selection. In menu mode the reply stream is
+    /// dropped (closed), so the `sc menu` client reads an empty reply.
+    fn close_launcher(&mut self) {
+        if let Some(l) = self.launcher.take() {
+            drop_launcher_surface(l.surface, l.shell, l.node, l.buffer, l.old);
+            self.request_manage();
+        }
+    }
+
+    /// Act on the highlighted row: spawn (apps) or reply to the client (menu),
+    /// then close.
+    fn launcher_launch(&mut self) {
+        use std::io::Write;
+        let Some(l) = self.launcher.take() else {
+            return;
+        };
+        let Launcher {
+            surface,
+            shell,
+            node,
+            buffer,
+            old,
+            entries,
+            action,
+            matches,
+            selected,
+            ..
+        } = l;
+        let chosen = matches.get(selected).copied();
+        match action {
+            LauncherAction::Apps(execs) => {
+                if let Some(cmd) = chosen.and_then(|ei| execs.get(ei).cloned()) {
+                    let _ = std::process::Command::new("sh").arg("-c").arg(cmd).spawn();
+                }
+            }
+            LauncherAction::Menu(mut stream) => {
+                if let Some(ei) = chosen {
+                    let _ = writeln!(stream, "{}", entries[ei]);
+                    let _ = stream.flush();
+                }
+                // stream drops here → the client's read completes.
+            }
+        }
+        drop_launcher_surface(surface, shell, node, buffer, old);
+        self.request_manage();
+    }
+
+    /// Feed a keypress (keysym + its UTF-8 text) into the open launcher.
+    fn launcher_key(&mut self, sym: u32, utf8: String) {
+        use xkbcommon::xkb::keysyms as ks;
+        match sym {
+            ks::KEY_Escape => {
+                self.close_launcher();
+                return;
+            }
+            ks::KEY_Return | ks::KEY_KP_Enter => {
+                self.launcher_launch();
+                return;
+            }
+            _ => {}
+        }
+        let mut recompute = false;
+        {
+            let Some(l) = self.launcher.as_mut() else {
+                return;
+            };
+            match sym {
+                ks::KEY_BackSpace => {
+                    l.query.pop();
+                    recompute = true;
+                }
+                ks::KEY_Up => l.selected = l.selected.saturating_sub(1),
+                ks::KEY_Down | ks::KEY_Tab => {
+                    if l.selected + 1 < l.matches.len() {
+                        l.selected += 1;
+                    }
+                }
+                _ => {
+                    for c in utf8.chars() {
+                        if !c.is_control() {
+                            l.query.push(c);
+                            recompute = true;
+                        }
+                    }
+                }
+            }
+        }
+        if recompute {
+            if let Some(l) = self.launcher.as_mut() {
+                l.matches = launcher::filter(&l.entries, &l.query);
+                l.selected = 0;
+                l.scroll = 0;
+            }
+        }
+        self.request_manage();
+    }
+
+    /// Draw the fullscreen fuzzy launcher on the focused monitor (translucent, on
+    /// top of everything). Rebuilds the buffer only when the query/selection/size
+    /// changes. Runs inside the render sequence (from `do_render`).
+    fn render_launcher(&mut self, qh: &QueueHandle<Self>) {
+        if self.launcher.is_none() {
+            return;
+        }
+        let Some(shm) = self.shm.clone() else {
+            return;
+        };
+        let mon = self
+            .monitors
+            .list
+            .get(self.monitors.focus)
+            .or_else(|| self.monitors.list.first());
+        let Some(rect) = mon.map(|m| m.rect) else {
+            return;
+        };
+        let w = rect.w.max(1);
+        let h = rect.h.max(1);
+
+        const QBOX: i32 = 52; // search box height
+        const ROW: i32 = 36; // result row height
+        let pw = (w - 160).clamp(240, self.launcher_theme.width.max(240));
+        let px = (w - pw) / 2;
+        let py = h / 6;
+        let list_top = py + QBOX + 8;
+        let vis = (((h - list_top - 40).max(ROW)) / ROW).max(1) as usize;
+
+        // Keep the selection visible.
+        {
+            let l = self.launcher.as_mut().unwrap();
+            if l.selected < l.scroll {
+                l.scroll = l.selected;
+            } else if l.selected >= l.scroll + vis {
+                l.scroll = l.selected + 1 - vis;
+            }
+        }
+
+        let sig = {
+            use std::hash::{Hash, Hasher};
+            let l = self.launcher.as_ref().unwrap();
+            let mut hs = std::collections::hash_map::DefaultHasher::new();
+            (w, h, l.selected, l.scroll, l.matches.len()).hash(&mut hs);
+            l.query.hash(&mut hs);
+            hs.finish()
+        };
+
+        if self.launcher.as_ref().unwrap().last_sig != Some(sig) {
+            if self.font_system.is_none() {
+                self.font_system = Some(cosmic_text::FontSystem::new());
+                self.swash_cache = Some(cosmic_text::SwashCache::new());
+            }
+            let mut fs = self.font_system.take().unwrap();
+            let mut sc = self.swash_cache.take().unwrap();
+
+            let t = self.launcher_theme;
+            let mut data = vec![0u8; w as usize * h as usize * 4];
+            fill_rect(&mut data, w, h, 0, 0, w, h, t.dim); // dim backdrop
+            fill_rect(&mut data, w, h, px, py, pw, QBOX, t.bg); // search box
+            {
+                let l = self.launcher.as_ref().unwrap();
+                let qy = py + (QBOX - 22) / 2;
+                if l.query.is_empty() {
+                    let hint = (t.fg.0, t.fg.1, t.fg.2, 0x60); // faded query hint
+                    draw_text(
+                        &mut data, w, h, px + 16, qy, "Type to search…", 22.0, hint, None,
+                        &mut fs, &mut sc,
+                    );
+                } else {
+                    draw_text(
+                        &mut data, w, h, px + 16, qy, &l.query, 22.0, t.fg, None, &mut fs, &mut sc,
+                    );
+                    let cw = measure_text(&mut fs, &l.query, 22.0, None);
+                    fill_rect(&mut data, w, h, px + 18 + cw, py + 12, 2, QBOX - 24, t.sel_bg);
+                }
+                let end = (l.scroll + vis).min(l.matches.len());
+                for (row, mi) in (l.scroll..end).enumerate() {
+                    let ai = l.matches[mi];
+                    let ry = list_top + row as i32 * ROW;
+                    let selected = mi == l.selected;
+                    let (bg, fg) = if selected {
+                        (t.sel_bg, t.sel_fg)
+                    } else {
+                        (t.bg, t.fg)
+                    };
+                    fill_rect(&mut data, w, h, px, ry, pw, ROW, bg);
+                    draw_text(
+                        &mut data, w, h, px + 16, ry + (ROW - 16) / 2, &l.entries[ai], 16.0,
+                        fg, None, &mut fs, &mut sc,
+                    );
+                }
+            }
+            premultiply(&mut data);
+
+            let l = self.launcher.as_mut().unwrap();
+            if let Some((b, _)) = l.old.take() {
+                b.destroy();
+            }
+            l.old = match (l.buffer.take(), l.backing.take()) {
+                (Some(b), Some(f)) => Some((b, f)),
+                _ => None,
+            };
+            match shm_file(&data) {
+                Ok(file) => {
+                    let pool = shm.create_pool(file.as_fd(), data.len() as i32, qh, ());
+                    let buffer = pool.create_buffer(0, w, h, w * 4, wl_shm::Format::Argb8888, qh, ());
+                    pool.destroy();
+                    l.shell.sync_next_commit();
+                    l.surface.attach(Some(&buffer), 0, 0);
+                    l.surface.damage_buffer(0, 0, w, h);
+                    l.surface.commit();
+                    l.buffer = Some(buffer);
+                    l.backing = Some(file);
+                    l.last_sig = Some(sig);
+                }
+                Err(e) => eprintln!("sfwm: launcher: shm buffer failed: {e}"),
+            }
+
+            self.font_system = Some(fs);
+            self.swash_cache = Some(sc);
+        }
+
+        let l = self.launcher.as_mut().unwrap();
+        l.node.set_position(rect.x, rect.y);
+        l.node.place_top();
     }
 
     /// Dim inactive windows by attaching a semi-transparent decoration surface
@@ -1148,6 +2574,347 @@ fn spawn_autostart(sock: &std::path::Path) {
     }
 }
 
+/// Fill an axis-aligned rect of a BGRA buffer (`bw`×`bh`) with `(r,g,b,a)`.
+fn fill_rect(buf: &mut [u8], bw: i32, bh: i32, x: i32, y: i32, rw: i32, rh: i32, c: (u8, u8, u8, u8)) {
+    let (r, g, b, a) = c;
+    for yy in y.max(0)..(y + rh).min(bh) {
+        for xx in x.max(0)..(x + rw).min(bw) {
+            let i = ((yy * bw + xx) * 4) as usize;
+            buf[i] = b;
+            buf[i + 1] = g;
+            buf[i + 2] = r;
+            buf[i + 3] = a;
+        }
+    }
+}
+
+/// A stable hash of a wallpaper's content, so the renderer can skip re-decoding
+/// when nothing changed (paired with the monitor size in `Wallpaper::last_sig`).
+fn content_sig(c: &WallpaperContent) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match c {
+        WallpaperContent::Color(col) => {
+            0u8.hash(&mut h);
+            col.hash(&mut h);
+        }
+        WallpaperContent::Image { path, mode } => {
+            1u8.hash(&mut h);
+            path.hash(&mut h);
+            (*mode as u8).hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+/// Render a wallpaper's contents into a fresh `w`×`h` BGRA buffer.
+fn render_wallpaper_pixels(content: &WallpaperContent, w: i32, h: i32) -> Vec<u8> {
+    let mut data = vec![0u8; w as usize * h as usize * 4];
+    match content {
+        WallpaperContent::Color(c) => fill_rect(&mut data, w, h, 0, 0, w, h, *c),
+        WallpaperContent::Image { path, mode } => {
+            // Opaque black backdrop behind any letterboxing / transparency.
+            fill_rect(&mut data, w, h, 0, 0, w, h, (0, 0, 0, 0xff));
+            match image::open(path) {
+                Ok(img) => draw_image(&mut data, w, h, &img.to_rgba8(), *mode),
+                Err(e) => eprintln!("sfwm: wallpaper: cannot load {}: {e}", path.display()),
+            }
+        }
+    }
+    data
+}
+
+/// Composite `src` (RGBA) into a `dw`×`dh` BGRA buffer, fitted by `mode`. Output
+/// pixels are made opaque (wallpaper is the bottom layer).
+fn draw_image(data: &mut [u8], dw: i32, dh: i32, src: &image::RgbaImage, mode: WallMode) {
+    use image::imageops::FilterType;
+    let (sw, sh) = (src.width() as i32, src.height() as i32);
+    if sw == 0 || sh == 0 {
+        return;
+    }
+    // Blit a positioned RGBA image into the BGRA destination at offset (ox, oy).
+    fn blit(data: &mut [u8], dw: i32, dh: i32, img: &image::RgbaImage, ox: i32, oy: i32) {
+        for (px, py, p) in img.enumerate_pixels() {
+            let x = ox + px as i32;
+            let y = oy + py as i32;
+            if x < 0 || y < 0 || x >= dw || y >= dh {
+                continue;
+            }
+            let i = ((y * dw + x) * 4) as usize;
+            data[i] = p[2];
+            data[i + 1] = p[1];
+            data[i + 2] = p[0];
+            data[i + 3] = 0xff;
+        }
+    }
+    match mode {
+        WallMode::Stretch => {
+            let r = image::imageops::resize(src, dw as u32, dh as u32, FilterType::Triangle);
+            blit(data, dw, dh, &r, 0, 0);
+        }
+        WallMode::Fit | WallMode::Fill => {
+            let sx = dw as f32 / sw as f32;
+            let sy = dh as f32 / sh as f32;
+            let scale = if mode == WallMode::Fit { sx.min(sy) } else { sx.max(sy) };
+            let nw = ((sw as f32 * scale).round() as u32).max(1);
+            let nh = ((sh as f32 * scale).round() as u32).max(1);
+            let r = image::imageops::resize(src, nw, nh, FilterType::Triangle);
+            blit(data, dw, dh, &r, (dw - nw as i32) / 2, (dh - nh as i32) / 2);
+        }
+        WallMode::Center => blit(data, dw, dh, src, (dw - sw) / 2, (dh - sh) / 2),
+        WallMode::Tile => {
+            let mut oy = 0;
+            while oy < dh {
+                let mut ox = 0;
+                while ox < dw {
+                    blit(data, dw, dh, src, ox, oy);
+                    ox += sw;
+                }
+                oy += sh;
+            }
+        }
+    }
+}
+
+/// Destroy a launcher's Wayland objects (proxies aren't freed on drop).
+fn drop_launcher_surface(
+    surface: WlSurface,
+    shell: RiverShellSurfaceV1,
+    node: RiverNodeV1,
+    buffer: Option<WlBuffer>,
+    old: Option<(WlBuffer, std::fs::File)>,
+) {
+    if let Some(b) = buffer {
+        b.destroy();
+    }
+    if let Some((b, _)) = old {
+        b.destroy();
+    }
+    node.destroy();
+    shell.destroy();
+    surface.destroy();
+}
+
+/// Alpha-blend a tray icon (straight-alpha BGRA, `icon.width`×`icon.height`),
+/// nearest-neighbor scaled to `size`×`size`, into a BGRA buffer at (`x`,`y`).
+/// Nearest-neighbor is fine for the small (~22px) tray icons and keeps it cheap.
+fn draw_icon(dst: &mut [u8], dw: i32, dh: i32, x: i32, y: i32, size: i32, icon: &tray::TrayIcon) {
+    let (iw, ih) = (icon.width as i32, icon.height as i32);
+    if iw <= 0 || ih <= 0 || size <= 0 {
+        return;
+    }
+    for oy in 0..size {
+        let sy = oy * ih / size;
+        let dy = y + oy;
+        if dy < 0 || dy >= dh {
+            continue;
+        }
+        for ox in 0..size {
+            let dx = x + ox;
+            if dx < 0 || dx >= dw {
+                continue;
+            }
+            let sx = ox * iw / size;
+            let si = ((sy * iw + sx) * 4) as usize;
+            if si + 3 >= icon.bgra.len() {
+                continue;
+            }
+            let (b, g, r, a) = (icon.bgra[si], icon.bgra[si + 1], icon.bgra[si + 2], icon.bgra[si + 3]);
+            let di = ((dy * dw + dx) * 4) as usize;
+            blend_px(&mut dst[di..di + 4], (r, g, b), a);
+        }
+    }
+}
+
+/// Convert a straight-alpha BGRA buffer to premultiplied alpha (what wl_shm
+/// ARGB8888 expects for correct translucency — used by the launcher overlay).
+fn premultiply(data: &mut [u8]) {
+    for px in data.chunks_exact_mut(4) {
+        let a = px[3] as u32;
+        px[0] = (px[0] as u32 * a / 255) as u8;
+        px[1] = (px[1] as u32 * a / 255) as u8;
+        px[2] = (px[2] as u32 * a / 255) as u8;
+    }
+}
+
+/// Alpha-blend `src` (r,g,b) over one BGRA pixel at coverage `a` (0..=255).
+fn blend_px(px: &mut [u8], src: (u8, u8, u8), a: u8) {
+    let af = a as f32 / 255.0;
+    px[0] = (src.2 as f32 * af + px[0] as f32 * (1.0 - af)) as u8;
+    px[1] = (src.1 as f32 * af + px[1] as f32 * (1.0 - af)) as u8;
+    px[2] = (src.0 as f32 * af + px[2] as f32 * (1.0 - af)) as u8;
+    px[3] = 255;
+}
+
+/// Shape one line of text (no wrapping) with system-font fallback.
+fn shape_text(
+    fs: &mut cosmic_text::FontSystem,
+    text: &str,
+    font_size: f32,
+    family: Option<&str>,
+) -> cosmic_text::Buffer {
+    use cosmic_text::{Attrs, Buffer, Family, Metrics, Shaping};
+    let mut buffer = Buffer::new(fs, Metrics::new(font_size, font_size * 1.3));
+    buffer.set_size(fs, Some(100_000.0), Some(font_size * 1.3));
+    let mut attrs = Attrs::new();
+    if let Some(name) = family {
+        attrs = attrs.family(Family::Name(name));
+    }
+    buffer.set_text(fs, text, attrs, Shaping::Advanced);
+    buffer.shape_until_scroll(fs, false);
+    buffer
+}
+
+/// Shape `text` wrapped to `wrap_w` px wide (multi-line); used by notifications.
+fn shape_wrapped(
+    fs: &mut cosmic_text::FontSystem,
+    text: &str,
+    font_size: f32,
+    wrap_w: f32,
+) -> cosmic_text::Buffer {
+    use cosmic_text::{Attrs, Buffer, Metrics, Shaping};
+    let mut buffer = Buffer::new(fs, Metrics::new(font_size, font_size * 1.35));
+    buffer.set_size(fs, Some(wrap_w), None);
+    buffer.set_text(fs, text, Attrs::new(), Shaping::Advanced);
+    buffer.shape_until_scroll(fs, false);
+    buffer
+}
+
+/// (width, line-count) of `text` wrapped to `wrap_w`.
+fn measure_wrapped(
+    fs: &mut cosmic_text::FontSystem,
+    text: &str,
+    font_size: f32,
+    wrap_w: f32,
+) -> (i32, i32) {
+    if text.is_empty() {
+        return (0, 0);
+    }
+    let buffer = shape_wrapped(fs, text, font_size, wrap_w);
+    let mut w = 0.0f32;
+    let mut lines = 0;
+    for run in buffer.layout_runs() {
+        w = w.max(run.line_w);
+        lines += 1;
+    }
+    (w.ceil() as i32, lines)
+}
+
+/// Draw `text` wrapped to `wrap_w`, top-left at `(pen_x, pen_y)`.
+#[allow(clippy::too_many_arguments)]
+fn draw_wrapped(
+    buf: &mut [u8],
+    bw: i32,
+    bh: i32,
+    pen_x: i32,
+    pen_y: i32,
+    text: &str,
+    font_size: f32,
+    color: (u8, u8, u8, u8),
+    wrap_w: f32,
+    fs: &mut cosmic_text::FontSystem,
+    sc: &mut cosmic_text::SwashCache,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let buffer = shape_wrapped(fs, text, font_size, wrap_w);
+    let tc = cosmic_text::Color::rgba(color.0, color.1, color.2, color.3);
+    buffer.draw(fs, sc, tc, |gx, gy, gw, gh, col| {
+        let a = col.a();
+        if a == 0 {
+            return;
+        }
+        for dy in 0..gh as i32 {
+            for dx in 0..gw as i32 {
+                let px = pen_x + gx + dx;
+                let py = pen_y + gy + dy;
+                if px < 0 || py < 0 || px >= bw || py >= bh {
+                    continue;
+                }
+                let i = ((py * bw + px) * 4) as usize;
+                blend_px(&mut buf[i..i + 4], (col.r(), col.g(), col.b()), a);
+            }
+        }
+    });
+}
+
+/// Pixel width of `text` at `font_size` (ceil of the widest layout run).
+fn measure_text(
+    fs: &mut cosmic_text::FontSystem,
+    text: &str,
+    font_size: f32,
+    family: Option<&str>,
+) -> i32 {
+    if text.is_empty() {
+        return 0;
+    }
+    shape_text(fs, text, font_size, family)
+        .layout_runs()
+        .map(|r| r.line_w)
+        .fold(0.0_f32, f32::max)
+        .ceil() as i32
+}
+
+/// Draw `text` into a BGRA buffer at pen `(pen_x, pen_y)`, blending glyph
+/// coverage over whatever's already there, in `color`.
+#[allow(clippy::too_many_arguments)]
+fn draw_text(
+    buf: &mut [u8],
+    bw: i32,
+    bh: i32,
+    pen_x: i32,
+    pen_y: i32,
+    text: &str,
+    font_size: f32,
+    color: (u8, u8, u8, u8),
+    family: Option<&str>,
+    fs: &mut cosmic_text::FontSystem,
+    sc: &mut cosmic_text::SwashCache,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let buffer = shape_text(fs, text, font_size, family);
+    let tc = cosmic_text::Color::rgba(color.0, color.1, color.2, color.3);
+    buffer.draw(fs, sc, tc, |gx, gy, gw, gh, col| {
+        let a = col.a();
+        if a == 0 {
+            return;
+        }
+        for dy in 0..gh as i32 {
+            for dx in 0..gw as i32 {
+                let px = pen_x + gx + dx;
+                let py = pen_y + gy + dy;
+                if px < 0 || py < 0 || px >= bw || py >= bh {
+                    continue;
+                }
+                let i = ((py * bw + px) * 4) as usize;
+                blend_px(&mut buf[i..i + 4], (col.r(), col.g(), col.b()), a);
+            }
+        }
+    });
+}
+
+/// Create an anonymous, sized, filled backing file for a `wl_shm` pool. The file
+/// is unlinked immediately; the returned fd keeps it alive while the compositor
+/// has it mapped.
+fn shm_file(data: &[u8]) -> std::io::Result<std::fs::File> {
+    use std::io::Write;
+    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    let path = format!("{dir}/sfwm-bar-{}", std::process::id());
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)?;
+    let _ = std::fs::remove_file(&path); // unlink; the fd stays valid
+    file.write_all(data)?;
+    file.flush()?;
+    Ok(file)
+}
+
 fn main() {
     let conn = Connection::connect_to_env()
         .expect("could not connect to a Wayland display — is WAYLAND_DISPLAY set? run this under river");
@@ -1176,6 +2943,11 @@ fn main() {
     let compositor: Option<WlCompositor> = globals.bind(&qh, 1..=6, ()).ok();
     let viewporter: Option<WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
     let spb: Option<WpSinglePixelBufferManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
+    let shm: Option<WlShm> = globals.bind(&qh, 1..=1, ()).ok();
+    // Bind a wl_seat so we can get a wl_keyboard for the launcher's text input
+    // (the WM otherwise never needs raw keyboard — river-xkb-bindings covers keys).
+    // The keyboard is fetched in the wl_seat Capabilities event.
+    let _wl_seat: Option<WlSeat> = globals.bind(&qh, 1..=8, ()).ok();
 
     let mut state = State {
         wm: Some(wm),
@@ -1220,13 +2992,72 @@ fn main() {
         viewporter,
         spb,
         dim_buffer: None,
+        shm,
+        bar: None,
+        wallpapers: HashMap::new(),
+        loop_handle: None,
+        bar_tx: None,
+        font_system: None,
+        swash_cache: None,
+        next_bar_module: 0,
         inactive_dim: 0.0,
+        notifications: Vec::new(),
+        notif_theme: NotifTheme::default(),
+        wl_keyboard: None,
+        xkb_state: None,
+        launcher: None,
+        launcher_theme: LauncherTheme::default(),
+        apps: Vec::new(),
+        tray_items: Vec::new(),
+        tray_cmd: None,
+        wl_pointer: None,
+        pointer_over_bar: false,
+        bar_pointer: (0, 0),
+        last_pointer_button: 0x110, // BTN_LEFT
     };
 
     // --- calloop event loop: Wayland + the IPC socket on one thread ---
-    let mut event_loop: EventLoop<State> =
+    let mut event_loop: EventLoop<'static, State> =
         EventLoop::try_new().expect("failed to create the calloop event loop");
     let handle = event_loop.handle();
+    state.loop_handle = Some(handle.clone());
+
+    // Channel for bar-executor worker threads to push output back to the main
+    // thread, where it's drawn (so a slow command never blocks the WM).
+    let (bar_tx, bar_rx) = calloop::channel::channel::<(u64, String)>();
+    state.bar_tx = Some(bar_tx);
+    handle
+        .insert_source(bar_rx, |event, _, state: &mut State| {
+            if let calloop::channel::Event::Msg((id, text)) = event {
+                state.set_bar_module_text(id, text);
+            }
+        })
+        .expect("failed to insert the bar channel source");
+
+    // Notifications: a D-Bus thread (org.freedesktop.Notifications) hands popups
+    // to the main loop over this channel; the main thread draws them.
+    let (notif_tx, notif_rx) = calloop::channel::channel::<notify::NotifEvent>();
+    handle
+        .insert_source(notif_rx, |event, _, state: &mut State| {
+            if let calloop::channel::Event::Msg(ev) = event {
+                state.handle_notif_event(ev);
+            }
+        })
+        .expect("failed to insert the notification channel source");
+    notify::spawn_notification_service(notif_tx);
+
+    // System tray: an SNI Watcher+Host D-Bus thread reports item add/change/remove
+    // over this channel; the main thread stores them and the bar draws their icons.
+    // Clicks route back to the thread via the returned command sender.
+    let (tray_tx, tray_rx) = calloop::channel::channel::<tray::TrayEvent>();
+    handle
+        .insert_source(tray_rx, |event, _, state: &mut State| {
+            if let calloop::channel::Event::Msg(ev) = event {
+                state.handle_tray_event(ev);
+            }
+        })
+        .expect("failed to insert the tray channel source");
+    state.tray_cmd = Some(tray::spawn_tray(tray_tx));
 
     WaylandSource::new(conn.clone(), event_queue)
         .insert(handle.clone())
@@ -1474,6 +3305,27 @@ impl Dispatch<RiverSeatV1, ()> for State {
                     state.request_manage();
                 }
             }
+            // Click on one of our own shell surfaces (the bar). river guarantees this
+            // event; wl_pointer to the bar may or may not be delivered, so this is the
+            // reliable click trigger. If wl_pointer IS working (pointer_over_bar), that
+            // path already routed the click — skip here to avoid a double action.
+            Event::ShellSurfaceInteraction { shell_surface } => {
+                let is_bar = state
+                    .bar
+                    .as_ref()
+                    .is_some_and(|b| b.shell.id() == shell_surface.id());
+                eprintln!(
+                    "sfwm: bar: shell_surface_interaction is_bar={is_bar} over_bar={} pos={:?}",
+                    state.pointer_over_bar, state.pointer_pos
+                );
+                if is_bar && !state.pointer_over_bar {
+                    if let Some(origin) = state.bar.as_ref().map(|b| b.origin) {
+                        let lx = state.pointer_pos.0 - origin.0;
+                        let button = state.last_pointer_button;
+                        state.bar_click(lx, button);
+                    }
+                }
+            }
             // Interactive move/resize: op_delta is cumulative since op start.
             Event::OpDelta { dx, dy } => {
                 if let Some(op) = state.op.as_ref().map(|o| (o.win, o.resize, o.start_geo)) {
@@ -1537,6 +3389,151 @@ impl Dispatch<RiverNodeV1, ()> for State {
     }
 }
 
+// A standard wl_seat, bound only so the launcher can receive keyboard text.
+impl Dispatch<WlSeat, ()> for State {
+    fn event(
+        state: &mut Self,
+        seat: &WlSeat,
+        event: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_seat::Event::Capabilities {
+            capabilities: WEnum::Value(caps),
+        } = event
+        {
+            if caps.contains(wl_seat::Capability::Keyboard) && state.wl_keyboard.is_none() {
+                state.wl_keyboard = Some(seat.get_keyboard(qh, ()));
+            }
+            if caps.contains(wl_seat::Capability::Pointer) && state.wl_pointer.is_none() {
+                state.wl_pointer = Some(seat.get_pointer(qh, ()));
+            }
+        }
+    }
+}
+
+// wl_pointer: sfwm's own shell surfaces (the bar) receive pointer input directly
+// (river routes it, unlike windows which only surface as `window_interaction`), so
+// this is how bar executors and tray icons get their clicks. We only act on input
+// over the bar surface; everything else (window focus, move/resize) goes through
+// river_seat_v1 / pointer bindings.
+impl Dispatch<WlPointer, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &WlPointer,
+        event: wl_pointer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use wl_pointer::Event;
+        match event {
+            Event::Enter { surface, surface_x, surface_y, .. } => {
+                state.pointer_over_bar = state
+                    .bar
+                    .as_ref()
+                    .is_some_and(|b| b.surface.id() == surface.id());
+                if state.pointer_over_bar {
+                    state.bar_pointer = (surface_x as i32, surface_y as i32);
+                }
+            }
+            Event::Leave { .. } => state.pointer_over_bar = false,
+            Event::Motion { surface_x, surface_y, .. } => {
+                if state.pointer_over_bar {
+                    state.bar_pointer = (surface_x as i32, surface_y as i32);
+                }
+            }
+            Event::Button { button, state: WEnum::Value(wl_pointer::ButtonState::Pressed), .. } => {
+                // Remember the button so the river `shell_surface_interaction`
+                // fallback (below) can route with the right button if wl_pointer
+                // enter/motion isn't being delivered to our shell surface.
+                state.last_pointer_button = button;
+                eprintln!("sfwm: bar: wl_pointer button={button} over_bar={}", state.pointer_over_bar);
+                if state.pointer_over_bar {
+                    let lx = state.bar_pointer.0;
+                    state.bar_click(lx, button);
+                }
+            }
+            Event::Axis { axis: WEnum::Value(axis), value, .. } => {
+                if state.pointer_over_bar {
+                    state.bar_scroll(axis, value);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// wl_keyboard: only consumed while the launcher is open (river-xkb-bindings handle
+// all other keys). Builds xkb state from the keymap, resolves each keypress to a
+// keysym + UTF-8, and feeds it to the launcher.
+impl Dispatch<WlKeyboard, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &WlKeyboard,
+        event: wl_keyboard::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use wl_keyboard::Event;
+        match event {
+            Event::Keymap {
+                format: WEnum::Value(wl_keyboard::KeymapFormat::XkbV1),
+                fd,
+                size,
+            } => {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut file = std::fs::File::from(fd);
+                let mut buf = vec![0u8; size as usize];
+                if file.seek(SeekFrom::Start(0)).is_ok() && file.read_exact(&mut buf).is_ok() {
+                    while buf.last() == Some(&0) {
+                        buf.pop();
+                    }
+                    if let Ok(s) = String::from_utf8(buf) {
+                        let ctx = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
+                        if let Some(km) = xkbcommon::xkb::Keymap::new_from_string(
+                            &ctx,
+                            s,
+                            xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1,
+                            xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+                        ) {
+                            state.xkb_state = Some(xkbcommon::xkb::State::new(&km));
+                        }
+                    }
+                }
+            }
+            Event::Modifiers {
+                mods_depressed,
+                mods_latched,
+                mods_locked,
+                group,
+                ..
+            } => {
+                if let Some(xs) = state.xkb_state.as_mut() {
+                    xs.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
+                }
+            }
+            Event::Key {
+                key,
+                state: WEnum::Value(wl_keyboard::KeyState::Pressed),
+                ..
+            } => {
+                if state.launcher.is_some() {
+                    if let Some((sym, utf8)) = state.xkb_state.as_ref().map(|xs| {
+                        let kc: xkbcommon::xkb::Keycode = (key + 8).into();
+                        (xs.key_get_one_sym(kc).raw(), xs.key_get_utf8(kc))
+                    }) {
+                        state.launcher_key(sym, utf8);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 // The xkb-bindings manager global has no events.
 impl Dispatch<RiverXkbBindingsV1, ()> for State {
     fn event(
@@ -1590,6 +3587,9 @@ ignore_events!(
     WpViewport,
     WpSinglePixelBufferManagerV1,
     RiverDecorationV1,
+    WlShm,
+    WlShmPool,
+    RiverShellSurfaceV1,
 );
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
