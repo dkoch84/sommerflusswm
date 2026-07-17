@@ -175,7 +175,7 @@ struct HitZone {
 enum HitKind {
     /// An executor module (id) — runs its `lclick`/`rclick` shell command.
     Exec(u64),
-    /// A tray icon (item key) — Activate / SecondaryActivate / ContextMenu.
+    /// A tray icon (item key) — Activate / SecondaryActivate / open its menu.
     Tray(String),
 }
 
@@ -357,6 +357,77 @@ struct Launcher {
     scroll: usize,
     /// Hash of (size, query, selected, scroll) so we only re-rasterize on change.
     last_sig: Option<u64>,
+}
+
+/// A WM-drawn tray context menu (com.canonical.dbusmenu), rendered as an
+/// interactive fullscreen overlay like the launcher: a transparent backdrop that
+/// captures all pointer input (click-outside closes it) with the menu drawn as
+/// one or more cascading columns anchored at the clicked tray icon. sfwm draws
+/// it and routes hover/click itself — appindicator apps (nm-applet, etc.) can't
+/// pop their own menus under sfwm, so the WM speaks dbusmenu directly.
+struct TrayMenu {
+    surface: WlSurface,
+    shell: RiverShellSurfaceV1,
+    node: RiverNodeV1,
+    buffer: Option<WlBuffer>,
+    backing: Option<std::fs::File>,
+    old: Option<(WlBuffer, std::fs::File)>,
+    /// Tray item key — used to send `MenuClicked` back to the item.
+    key: String,
+    /// The menu tree (root level).
+    root: Vec<tray::MenuNode>,
+    /// Global anchor (the tray icon position); columns fan out from here.
+    anchor: (i32, i32),
+    /// Monitor rect the overlay covers (for clamping columns on-screen).
+    mon: Rect,
+    /// Cascade path: `open_path[i]` is the row index (into column `i`'s visible
+    /// rows) of the submenu that opened column `i+1`. Column 0 is always the root.
+    open_path: Vec<usize>,
+    /// Hover highlight as (column, row-in-column).
+    hover: Option<(usize, usize)>,
+    /// Column geometry recorded on the last render, in surface-local coords, for
+    /// hit-testing pointer motion/clicks.
+    columns: Vec<MenuColumn>,
+    /// Hash of the visual state, so we only re-rasterize on change.
+    last_sig: Option<u64>,
+}
+
+/// One rendered menu column's placement + per-row hit rectangles (surface-local).
+struct MenuColumn {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    rows: Vec<MenuRow>,
+}
+
+/// A single row's vertical extent within its column (surface-local y).
+struct MenuRow {
+    y0: i32,
+    y1: i32,
+}
+
+impl TrayMenu {
+    /// The visible node lists shown per open column, following `open_path`.
+    /// Column 0 is the root; each further column is the opened submenu's children.
+    fn columns_nodes(&self) -> Vec<Vec<&tray::MenuNode>> {
+        let mut cols: Vec<Vec<&tray::MenuNode>> = Vec::new();
+        let mut level: Vec<&tray::MenuNode> = self.root.iter().filter(|n| n.visible).collect();
+        cols.push(level.clone());
+        for &sel in &self.open_path {
+            let Some(node) = level.get(sel) else { break };
+            if !node.has_submenu {
+                break;
+            }
+            let next: Vec<&tray::MenuNode> = node.children.iter().filter(|n| n.visible).collect();
+            if next.is_empty() {
+                break;
+            }
+            cols.push(next.clone());
+            level = cols.last().unwrap().clone();
+        }
+        cols
+    }
 }
 
 /// How often an executor's command is run.
@@ -678,6 +749,12 @@ struct State {
     /// fallback can route with the correct button when wl_pointer focus isn't
     /// delivered to our shell surface. Defaults to BTN_LEFT.
     last_pointer_button: u32,
+    /// The open tray context menu (dbusmenu overlay), while one is showing.
+    tray_menu: Option<TrayMenu>,
+    /// True while the pointer is over the tray-menu surface (wl_pointer Enter/Leave).
+    pointer_over_menu: bool,
+    /// Latest surface-local pointer position over the tray menu.
+    menu_pointer: (i32, i32),
 }
 
 impl State {
@@ -1311,18 +1388,20 @@ impl State {
             }
         }
 
-        // Keyboard focus: the launcher grabs it while open, otherwise it follows
-        // the focused monitor's focused window.
+        // Keyboard focus: the tray menu (for Escape) then the launcher grab it
+        // while open, otherwise it follows the focused monitor's focused window.
+        let menu_shell = self.tray_menu.as_ref().map(|m| m.shell.clone());
         let launcher_shell = self.launcher.as_ref().map(|l| l.shell.clone());
         let focus_win = self
             .focused_window()
             .and_then(|wid| self.windows.get(&wid))
             .map(|w| w.win.clone());
         for seat in &self.seats {
-            match (&launcher_shell, &focus_win) {
-                (Some(shell), _) => seat.focus_shell_surface(shell),
-                (None, Some(w)) => seat.focus_window(w),
-                (None, None) => seat.clear_focus(),
+            match (&menu_shell, &launcher_shell, &focus_win) {
+                (Some(shell), _, _) => seat.focus_shell_surface(shell),
+                (None, Some(shell), _) => seat.focus_shell_surface(shell),
+                (None, None, Some(w)) => seat.focus_window(w),
+                (None, None, None) => seat.clear_focus(),
             }
         }
     }
@@ -1432,8 +1511,10 @@ impl State {
 
         // Notification popups sit on top of everything (placed last)...
         self.render_notifications(qh);
-        // ...except the launcher overlay, which is the very topmost when open.
+        // ...except the launcher overlay, which is the very topmost when open...
         self.render_launcher(qh);
+        // ...and the tray context menu, topmost of all while it's open.
+        self.render_menu(qh);
     }
 
     /// Draw and place the status bar, inside the render sequence. Rebuilds the
@@ -1618,7 +1699,7 @@ impl State {
     /// Route a pointer button press over the bar (at surface-local x `lx`) to
     /// whatever module is under the cursor: an executor's `lclick`/`rclick` shell
     /// command, or a tray icon's SNI action (left = Activate, middle =
-    /// SecondaryActivate, right = ContextMenu).
+    /// SecondaryActivate, right = open the dbusmenu overlay).
     fn bar_click(&mut self, lx: i32, button: u32) {
         const BTN_RIGHT: u32 = 0x111;
         const BTN_MIDDLE: u32 = 0x112;
@@ -1659,12 +1740,16 @@ impl State {
                     .iter()
                     .find(|i| i.key == key)
                     .is_some_and(|i| i.is_menu);
-                // The icon's screen position anchors the item's menu (SNI convention).
+                // The icon's screen position anchors the item's menu (SNI convention):
+                // just below the icon, at its left edge.
                 let (x, y) = (origin.0 + zx0, origin.1 + height);
                 let cmd = match button {
-                    BTN_RIGHT => tray::TrayCmd::ContextMenu { key, x, y },
+                    // Right-click (and left-click on menu-only items) opens the
+                    // dbusmenu overlay; the tray thread fetches it and replies with
+                    // TrayEvent::Menu for us to draw.
+                    BTN_RIGHT => tray::TrayCmd::OpenMenu { key, x, y },
                     BTN_MIDDLE => tray::TrayCmd::SecondaryActivate { key, x, y },
-                    _ if is_menu => tray::TrayCmd::ContextMenu { key, x, y },
+                    _ if is_menu => tray::TrayCmd::OpenMenu { key, x, y },
                     _ => tray::TrayCmd::Activate { key, x, y }, // BTN_LEFT
                 };
                 let _ = tx.send(cmd);
@@ -1703,8 +1788,354 @@ impl State {
                 }
             }
             tray::TrayEvent::Remove(key) => self.tray_items.retain(|i| i.key != key),
+            tray::TrayEvent::Menu { key, x, y, items } => {
+                self.open_tray_menu(key, items, (x, y));
+                return; // open_tray_menu already requested a manage
+            }
         }
         self.request_manage();
+    }
+
+    /// Open (or replace) the tray context-menu overlay for `key`, anchored at the
+    /// global point `anchor` (just below the clicked icon). An empty menu is
+    /// ignored. Mirrors the launcher's fullscreen-surface setup.
+    fn open_tray_menu(&mut self, key: String, items: Vec<tray::MenuNode>, anchor: (i32, i32)) {
+        self.close_tray_menu();
+        if items.iter().all(|n| !n.visible) {
+            return;
+        }
+        let (Some(comp), Some(wm)) = (self.compositor.clone(), self.wm.clone()) else {
+            return;
+        };
+        // Anchor to whichever monitor contains the icon (fall back to the first).
+        let mon = self
+            .monitors
+            .list
+            .iter()
+            .find(|m| {
+                anchor.0 >= m.rect.x
+                    && anchor.0 < m.rect.x + m.rect.w
+                    && anchor.1 >= m.rect.y
+                    && anchor.1 < m.rect.y + m.rect.h
+            })
+            .or_else(|| self.monitors.list.first());
+        let Some(mon_rect) = mon.map(|m| m.rect) else {
+            return;
+        };
+        let qh = self.qh.clone();
+        let surface = comp.create_surface(&qh, ());
+        let shell = wm.get_shell_surface(&surface, &qh, ());
+        let node = shell.get_node(&qh, ());
+        self.tray_menu = Some(TrayMenu {
+            surface,
+            shell,
+            node,
+            buffer: None,
+            backing: None,
+            old: None,
+            key,
+            root: items,
+            anchor,
+            mon: mon_rect,
+            open_path: Vec::new(),
+            hover: None,
+            columns: Vec::new(),
+            last_sig: None,
+        });
+        self.request_manage();
+    }
+
+    /// Tear down the tray menu overlay (no selection).
+    fn close_tray_menu(&mut self) {
+        if let Some(m) = self.tray_menu.take() {
+            drop_launcher_surface(m.surface, m.shell, m.node, m.buffer, m.old);
+            self.pointer_over_menu = false;
+            self.request_manage();
+        }
+    }
+
+    /// Pointer moved over the menu overlay: update the hover highlight and open or
+    /// collapse submenu columns as the cursor crosses submenu rows (cascade).
+    fn menu_pointer_moved(&mut self, sx: i32, sy: i32) {
+        self.menu_pointer = (sx, sy);
+        let Some(menu) = self.tray_menu.as_ref() else { return };
+        let hit = menu_hit(&menu.columns, sx, sy);
+        let mut new_open = menu.open_path.clone();
+        if let Some((col, row)) = hit {
+            let cols = menu.columns_nodes();
+            let has_sub = cols
+                .get(col)
+                .and_then(|c| c.get(row))
+                .map(|n| n.has_submenu && !n.is_separator)
+                .unwrap_or(false);
+            new_open.truncate(col);
+            if has_sub {
+                new_open.push(row);
+            }
+        }
+        let changed = hit != menu.hover || new_open != menu.open_path;
+        if changed {
+            let menu = self.tray_menu.as_mut().unwrap();
+            menu.hover = hit;
+            menu.open_path = new_open;
+            self.request_manage();
+        }
+    }
+
+    /// A click landed on the menu overlay at surface-local (`sx`,`sy`): activate a
+    /// leaf row, open a submenu row, or (outside every column) dismiss the menu.
+    fn menu_click(&mut self, sx: i32, sy: i32) {
+        let Some(menu) = self.tray_menu.as_ref() else { return };
+        let Some((col, row)) = menu_hit(&menu.columns, sx, sy) else {
+            self.close_tray_menu(); // clicked off the menu → dismiss
+            return;
+        };
+        let cols = menu.columns_nodes();
+        let Some(node) = cols.get(col).and_then(|c| c.get(row)) else {
+            return;
+        };
+        let (id, enabled, is_sep, has_sub) =
+            (node.id, node.enabled, node.is_separator, node.has_submenu);
+        let key = menu.key.clone();
+        if is_sep || !enabled {
+            return;
+        }
+        if has_sub {
+            let menu = self.tray_menu.as_mut().unwrap();
+            menu.open_path.truncate(col);
+            menu.open_path.push(row);
+            self.request_manage();
+            return;
+        }
+        if let Some(tx) = self.tray_cmd.as_ref() {
+            let _ = tx.send(tray::TrayCmd::MenuClicked { key, id });
+        }
+        self.close_tray_menu();
+    }
+
+    /// Keyboard while the menu is open: Escape dismisses it (mouse drives the rest).
+    fn menu_key(&mut self, sym: u32) {
+        use xkbcommon::xkb::keysyms as ks;
+        if sym == ks::KEY_Escape {
+            self.close_tray_menu();
+        }
+    }
+
+    /// Draw the tray context menu overlay: a transparent fullscreen surface with
+    /// one or more cascading opaque columns. Rebuilds the buffer only when the
+    /// size/anchor/open-path/hover changes. Runs inside the render sequence.
+    fn render_menu(&mut self, qh: &QueueHandle<Self>) {
+        if self.tray_menu.is_none() {
+            return;
+        }
+        let Some(shm) = self.shm.clone() else { return };
+
+        // Palette (kept in step with the launcher overlay).
+        const BG: (u8, u8, u8, u8) = (0x1d, 0x25, 0x2b, 0xff);
+        const FG: (u8, u8, u8, u8) = (0xf7, 0xf8, 0xf3, 0xff);
+        const SEL_BG: (u8, u8, u8, u8) = (0x4e, 0x9b, 0xcf, 0xff);
+        const SEL_FG: (u8, u8, u8, u8) = (0xff, 0xff, 0xff, 0xff);
+        const DIS_FG: (u8, u8, u8, u8) = (0xf7, 0xf8, 0xf3, 0x66);
+        const SEP: (u8, u8, u8, u8) = (0xff, 0xff, 0xff, 0x22);
+        const BORDER: (u8, u8, u8, u8) = (0x0a, 0x0c, 0x0f, 0xff);
+
+        const ROW: i32 = 26;
+        const SEPH: i32 = 7;
+        const PADX: i32 = 10;
+        const TOGW: i32 = 18; // toggle/checkbox gutter
+        const ICONW: i32 = 20; // icon gutter (columns with any row icon)
+        const ARROW: i32 = 16; // submenu-arrow gutter
+        const FONT: f32 = 14.0;
+        const MINW: i32 = 150;
+        const MAXW: i32 = 460;
+
+        let mon = self.tray_menu.as_ref().unwrap().mon;
+        let w = mon.w.max(1);
+        let h = mon.h.max(1);
+        let ax = self.tray_menu.as_ref().unwrap().anchor.0 - mon.x;
+        let ay = self.tray_menu.as_ref().unwrap().anchor.1 - mon.y;
+
+        if self.font_system.is_none() {
+            self.font_system = Some(cosmic_text::FontSystem::new());
+            self.swash_cache = Some(cosmic_text::SwashCache::new());
+        }
+        let mut fs = self.font_system.take().unwrap();
+        let mut sc = self.swash_cache.take().unwrap();
+
+        // --- lay out the cascade columns (surface-local geometry) ---
+        let cols_nodes = self.tray_menu.as_ref().unwrap().columns_nodes();
+        let open_path = self.tray_menu.as_ref().unwrap().open_path.clone();
+        let mut columns: Vec<MenuColumn> = Vec::with_capacity(cols_nodes.len());
+        for (ci, nodes) in cols_nodes.iter().enumerate() {
+            let has_icon = nodes.iter().any(|n| n.icon.is_some());
+            let mut textw = 0;
+            for n in nodes.iter() {
+                if !n.is_separator {
+                    textw = textw.max(measure_text(&mut fs, &n.label, FONT, None));
+                }
+            }
+            let iconw = if has_icon { ICONW } else { 0 };
+            let colw = (PADX + TOGW + iconw + textw + ARROW + PADX).clamp(MINW, MAXW);
+            let colh: i32 = nodes
+                .iter()
+                .map(|n| if n.is_separator { SEPH } else { ROW })
+                .sum::<i32>()
+                .max(ROW);
+
+            let (cx, cy) = if ci == 0 {
+                (ax.min(w - colw).max(0), ay.min(h - colh).max(0))
+            } else {
+                let parent = &columns[ci - 1];
+                let py0 = open_path
+                    .get(ci - 1)
+                    .and_then(|&r| parent.rows.get(r))
+                    .map(|r| r.y0)
+                    .unwrap_or(parent.y);
+                let mut x = parent.x + parent.w;
+                if x + colw > w {
+                    x = parent.x - colw; // no room right → flip to the left
+                }
+                let x = x.max(0).min((w - colw).max(0));
+                (x, py0.min(h - colh).max(0))
+            };
+
+            let mut rows = Vec::with_capacity(nodes.len());
+            let mut ry = cy;
+            for n in nodes.iter() {
+                let rh = if n.is_separator { SEPH } else { ROW };
+                rows.push(MenuRow { y0: ry, y1: ry + rh });
+                ry += rh;
+            }
+            columns.push(MenuColumn { x: cx, y: cy, w: colw, h: colh, rows });
+        }
+
+        let hover = self.tray_menu.as_ref().unwrap().hover;
+        let sig = {
+            use std::hash::{Hash, Hasher};
+            let mut hs = std::collections::hash_map::DefaultHasher::new();
+            (w, h, ax, ay).hash(&mut hs);
+            open_path.hash(&mut hs);
+            hover.hash(&mut hs);
+            self.tray_menu.as_ref().unwrap().root.len().hash(&mut hs);
+            hs.finish()
+        };
+
+        if self.tray_menu.as_ref().unwrap().last_sig != Some(sig) {
+            let mut data = vec![0u8; w as usize * h as usize * 4]; // transparent backdrop
+            for (ci, col) in columns.iter().enumerate() {
+                let nodes = &cols_nodes[ci];
+                let has_icon = nodes.iter().any(|n| n.icon.is_some());
+                let iconw = if has_icon { ICONW } else { 0 };
+                // border + background box
+                fill_rect(&mut data, w, h, col.x - 1, col.y - 1, col.w + 2, col.h + 2, BORDER);
+                fill_rect(&mut data, w, h, col.x, col.y, col.w, col.h, BG);
+
+                for (ri, node) in nodes.iter().enumerate() {
+                    let row = &col.rows[ri];
+                    if node.is_separator {
+                        let sy = row.y0 + (row.y1 - row.y0) / 2;
+                        fill_rect(&mut data, w, h, col.x + PADX, sy, col.w - 2 * PADX, 1, SEP);
+                        continue;
+                    }
+                    let on_path = ci < open_path.len() && open_path[ci] == ri;
+                    let highlight = node.enabled && (hover == Some((ci, ri)) || on_path);
+                    let fg = if !node.enabled {
+                        DIS_FG
+                    } else if highlight {
+                        SEL_FG
+                    } else {
+                        FG
+                    };
+                    if highlight {
+                        fill_rect(&mut data, w, h, col.x, row.y0, col.w, ROW, SEL_BG);
+                    }
+                    // toggle indicator
+                    if node.toggle_type != 0 {
+                        draw_toggle(
+                            &mut data,
+                            w,
+                            h,
+                            col.x + PADX,
+                            row.y0 + (ROW - 12) / 2,
+                            node.toggle_state == 1,
+                            fg,
+                        );
+                    }
+                    // row icon
+                    if has_icon {
+                        if let Some(icon) = &node.icon {
+                            let isz = ROW - 8;
+                            draw_icon(
+                                &mut data,
+                                w,
+                                h,
+                                col.x + PADX + TOGW,
+                                row.y0 + (ROW - isz) / 2,
+                                isz,
+                                icon,
+                            );
+                        }
+                    }
+                    // label
+                    draw_text(
+                        &mut data,
+                        w,
+                        h,
+                        col.x + PADX + TOGW + iconw,
+                        row.y0 + (ROW - 15) / 2,
+                        &node.label,
+                        FONT,
+                        fg,
+                        None,
+                        &mut fs,
+                        &mut sc,
+                    );
+                    // submenu arrow (a small right-pointing triangle)
+                    if node.has_submenu {
+                        let tx = col.x + col.w - PADX - 5;
+                        let tcy = row.y0 + ROW / 2;
+                        for i in 0..5 {
+                            let half = 4 - i;
+                            fill_rect(&mut data, w, h, tx + i, tcy - half, 1, 2 * half + 1, fg);
+                        }
+                    }
+                }
+            }
+            premultiply(&mut data);
+
+            let menu = self.tray_menu.as_mut().unwrap();
+            if let Some((b, _)) = menu.old.take() {
+                b.destroy();
+            }
+            menu.old = match (menu.buffer.take(), menu.backing.take()) {
+                (Some(b), Some(f)) => Some((b, f)),
+                _ => None,
+            };
+            match shm_file(&data) {
+                Ok(file) => {
+                    let pool = shm.create_pool(file.as_fd(), data.len() as i32, qh, ());
+                    let buffer =
+                        pool.create_buffer(0, w, h, w * 4, wl_shm::Format::Argb8888, qh, ());
+                    pool.destroy();
+                    menu.shell.sync_next_commit();
+                    menu.surface.attach(Some(&buffer), 0, 0);
+                    menu.surface.damage_buffer(0, 0, w, h);
+                    menu.surface.commit();
+                    menu.buffer = Some(buffer);
+                    menu.backing = Some(file);
+                    menu.last_sig = Some(sig);
+                }
+                Err(e) => eprintln!("sfwm: tray: menu shm buffer failed: {e}"),
+            }
+        }
+
+        self.font_system = Some(fs);
+        self.swash_cache = Some(sc);
+
+        let menu = self.tray_menu.as_mut().unwrap();
+        menu.columns = columns;
+        menu.node.set_position(mon.x, mon.y);
+        menu.node.place_top();
     }
 
     /// Update an executor module's displayed text (from its worker thread, via
@@ -2726,6 +3157,35 @@ fn draw_icon(dst: &mut [u8], dw: i32, dh: i32, x: i32, y: i32, size: i32, icon: 
     }
 }
 
+/// Which (column, row) of a laid-out tray menu a surface-local point falls on,
+/// or None if it's outside every column box (or on inter-row padding).
+fn menu_hit(columns: &[MenuColumn], sx: i32, sy: i32) -> Option<(usize, usize)> {
+    for (ci, col) in columns.iter().enumerate() {
+        if sx >= col.x && sx < col.x + col.w && sy >= col.y && sy < col.y + col.h {
+            for (ri, row) in col.rows.iter().enumerate() {
+                if sy >= row.y0 && sy < row.y1 {
+                    return Some((ci, ri));
+                }
+            }
+            return None;
+        }
+    }
+    None
+}
+
+/// Draw a 12×12 checkbox/radio indicator at (`x`,`y`): a box outline, filled in
+/// the centre when `on`. Same glyph for check and radio (kept font-free/reliable).
+fn draw_toggle(dst: &mut [u8], dw: i32, dh: i32, x: i32, y: i32, on: bool, c: (u8, u8, u8, u8)) {
+    const S: i32 = 12;
+    fill_rect(dst, dw, dh, x, y, S, 1, c);
+    fill_rect(dst, dw, dh, x, y + S - 1, S, 1, c);
+    fill_rect(dst, dw, dh, x, y, 1, S, c);
+    fill_rect(dst, dw, dh, x + S - 1, y, 1, S, c);
+    if on {
+        fill_rect(dst, dw, dh, x + 3, y + 3, S - 6, S - 6, c);
+    }
+}
+
 /// Convert a straight-alpha BGRA buffer to premultiplied alpha (what wl_shm
 /// ARGB8888 expects for correct translucency — used by the launcher overlay).
 fn premultiply(data: &mut [u8]) {
@@ -3010,6 +3470,9 @@ fn main() {
         apps: Vec::new(),
         tray_items: Vec::new(),
         tray_cmd: None,
+        tray_menu: None,
+        pointer_over_menu: false,
+        menu_pointer: (0, 0),
         wl_pointer: None,
         pointer_over_bar: false,
         bar_pointer: (0, 0),
@@ -3310,10 +3773,24 @@ impl Dispatch<RiverSeatV1, ()> for State {
             // reliable click trigger. If wl_pointer IS working (pointer_over_bar), that
             // path already routed the click — skip here to avoid a double action.
             Event::ShellSurfaceInteraction { shell_surface } => {
+                let ssid = shell_surface.id();
+                // Menu first: it's the topmost surface when open.
+                let menu_geo = state
+                    .tray_menu
+                    .as_ref()
+                    .filter(|m| m.shell.id() == ssid)
+                    .map(|m| m.mon);
+                if let Some(mon) = menu_geo {
+                    if !state.pointer_over_menu {
+                        let (mx, my) = (state.pointer_pos.0 - mon.x, state.pointer_pos.1 - mon.y);
+                        state.menu_click(mx, my);
+                    }
+                    return;
+                }
                 let is_bar = state
                     .bar
                     .as_ref()
-                    .is_some_and(|b| b.shell.id() == shell_surface.id());
+                    .is_some_and(|b| b.shell.id() == ssid);
                 eprintln!(
                     "sfwm: bar: shell_surface_interaction is_bar={is_bar} over_bar={} pos={:?}",
                     state.pointer_over_bar, state.pointer_pos
@@ -3430,17 +3907,32 @@ impl Dispatch<WlPointer, ()> for State {
         use wl_pointer::Event;
         match event {
             Event::Enter { surface, surface_x, surface_y, .. } => {
-                state.pointer_over_bar = state
-                    .bar
+                let sid = surface.id();
+                state.pointer_over_menu = state
+                    .tray_menu
                     .as_ref()
-                    .is_some_and(|b| b.surface.id() == surface.id());
-                if state.pointer_over_bar {
+                    .is_some_and(|m| m.surface.id() == sid);
+                state.pointer_over_bar = !state.pointer_over_menu
+                    && state.bar.as_ref().is_some_and(|b| b.surface.id() == sid);
+                if state.pointer_over_menu {
+                    state.menu_pointer_moved(surface_x as i32, surface_y as i32);
+                } else if state.pointer_over_bar {
                     state.bar_pointer = (surface_x as i32, surface_y as i32);
                 }
             }
-            Event::Leave { .. } => state.pointer_over_bar = false,
+            Event::Leave { surface, .. } => {
+                let sid = surface.id();
+                if state.tray_menu.as_ref().is_some_and(|m| m.surface.id() == sid) {
+                    state.pointer_over_menu = false;
+                }
+                if state.bar.as_ref().is_some_and(|b| b.surface.id() == sid) {
+                    state.pointer_over_bar = false;
+                }
+            }
             Event::Motion { surface_x, surface_y, .. } => {
-                if state.pointer_over_bar {
+                if state.pointer_over_menu {
+                    state.menu_pointer_moved(surface_x as i32, surface_y as i32);
+                } else if state.pointer_over_bar {
                     state.bar_pointer = (surface_x as i32, surface_y as i32);
                 }
             }
@@ -3449,8 +3941,11 @@ impl Dispatch<WlPointer, ()> for State {
                 // fallback (below) can route with the right button if wl_pointer
                 // enter/motion isn't being delivered to our shell surface.
                 state.last_pointer_button = button;
-                eprintln!("sfwm: bar: wl_pointer button={button} over_bar={}", state.pointer_over_bar);
-                if state.pointer_over_bar {
+                if state.pointer_over_menu {
+                    let (mx, my) = state.menu_pointer;
+                    state.menu_click(mx, my);
+                } else if state.pointer_over_bar {
+                    eprintln!("sfwm: bar: wl_pointer button={button} over_bar=true");
                     let lx = state.bar_pointer.0;
                     state.bar_click(lx, button);
                 }
@@ -3520,12 +4015,17 @@ impl Dispatch<WlKeyboard, ()> for State {
                 state: WEnum::Value(wl_keyboard::KeyState::Pressed),
                 ..
             } => {
-                if state.launcher.is_some() {
+                if state.tray_menu.is_some() || state.launcher.is_some() {
                     if let Some((sym, utf8)) = state.xkb_state.as_ref().map(|xs| {
                         let kc: xkbcommon::xkb::Keycode = (key + 8).into();
                         (xs.key_get_one_sym(kc).raw(), xs.key_get_utf8(kc))
                     }) {
-                        state.launcher_key(sym, utf8);
+                        // The menu (modal, on top) consumes keys before the launcher.
+                        if state.tray_menu.is_some() {
+                            state.menu_key(sym);
+                        } else {
+                            state.launcher_key(sym, utf8);
+                        }
                     }
                 }
             }

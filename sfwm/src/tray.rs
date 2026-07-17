@@ -25,7 +25,7 @@ use zbus::fdo::DBusProxy;
 use zbus::message::Header;
 use zbus::names::BusName;
 use zbus::object_server::SignalContext;
-use zbus::zvariant::OwnedObjectPath;
+use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, Proxy};
 
 /// Message from the tray thread to the WM main thread.
@@ -34,6 +34,40 @@ pub enum TrayEvent {
     Upsert(TrayItem),
     /// The item with this key went away.
     Remove(String),
+    /// The parsed dbusmenu for an item, ready for the WM to draw as a context
+    /// menu overlay. `(x, y)` is the anchor the WM asked to open at.
+    Menu {
+        key: String,
+        x: i32,
+        y: i32,
+        items: Vec<MenuNode>,
+    },
+}
+
+/// One entry in a tray item's com.canonical.dbusmenu tree. The WM renders these
+/// as cascading columns in a WM-drawn overlay (Stage-2 tray menus).
+#[derive(Clone)]
+pub struct MenuNode {
+    /// dbusmenu item id, echoed back in the `clicked` Event when activated.
+    pub id: i32,
+    /// Display label, mnemonic underscores stripped.
+    pub label: String,
+    /// Greyed-out and unclickable when false.
+    pub enabled: bool,
+    /// Hidden entirely when false.
+    pub visible: bool,
+    /// A horizontal divider (no label / not clickable).
+    pub is_separator: bool,
+    /// Has a submenu — the WM opens a child column and never sends `clicked`.
+    pub has_submenu: bool,
+    /// 0 = none, 1 = checkmark, 2 = radio.
+    pub toggle_type: u8,
+    /// 1 = on, 0 = off, -1 = indeterminate (only meaningful with a toggle_type).
+    pub toggle_state: i32,
+    /// Optional row icon (resolved from `icon-name`).
+    pub icon: Option<TrayIcon>,
+    /// Child entries (populated for submenu rows).
+    pub children: Vec<MenuNode>,
 }
 
 #[derive(Clone)]
@@ -69,12 +103,17 @@ pub struct TrayIcon {
 pub enum TrayCmd {
     Activate { key: String, x: i32, y: i32 },
     SecondaryActivate { key: String, x: i32, y: i32 },
-    ContextMenu { key: String, x: i32, y: i32 },
+    /// Fetch the item's dbusmenu and send it back as `TrayEvent::Menu` for the WM
+    /// to draw. Falls back to the SNI `ContextMenu` method if the item has no menu.
+    OpenMenu { key: String, x: i32, y: i32 },
+    /// The user activated a leaf menu row — send dbusmenu `Event(id, "clicked")`.
+    MenuClicked { key: String, id: i32 },
     Scroll { key: String, delta: i32, horizontal: bool },
 }
 
 const SNI_IFACE: &str = "org.kde.StatusNotifierItem";
 const SNI_PATH_DEFAULT: &str = "/StatusNotifierItem";
+const DBUSMENU_IFACE: &str = "com.canonical.dbusmenu";
 
 /// key -> (unique bus name, object path). Shared between the watcher (writes on
 /// register), the per-item tracking tasks (removes on death) and the command
@@ -240,6 +279,9 @@ async fn run(events: Sender<TrayEvent>, cmd_rx: Receiver<TrayCmd>) -> zbus::Resu
     let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
     let services = Arc::new(Mutex::new(Vec::new()));
 
+    // The command loop needs its own handle to report menus back to the WM.
+    let cmd_events = events.clone();
+
     let watcher = Watcher {
         events,
         registry: registry.clone(),
@@ -274,7 +316,7 @@ async fn run(events: Sender<TrayEvent>, cmd_rx: Receiver<TrayCmd>) -> zbus::Resu
         let registry = registry.clone();
         let _ = std::thread::Builder::new()
             .name("sfwm-tray-cmd".to_string())
-            .spawn(move || command_loop(conn, registry, cmd_rx));
+            .spawn(move || command_loop(conn, registry, cmd_events, cmd_rx));
     }
 
     // Keep the connection alive for the process lifetime; zbus' internal executor
@@ -713,36 +755,251 @@ fn icon_size_score(path: &Path) -> i32 {
 
 /// Blocking loop: for each click/scroll, look up the item's current
 /// destination/path and best-effort call the matching SNI method. Items commonly
-/// implement only a subset (many only ContextMenu), so all errors are ignored.
-fn command_loop(conn: Connection, registry: Registry, rx: Receiver<TrayCmd>) {
+/// implement only a subset, so all errors are ignored. `OpenMenu`/`MenuClicked`
+/// drive the com.canonical.dbusmenu side and report menus back via `events`.
+fn command_loop(conn: Connection, registry: Registry, events: Sender<TrayEvent>, rx: Receiver<TrayCmd>) {
     while let Ok(cmd) = rx.recv() {
         let key = match &cmd {
             TrayCmd::Activate { key, .. }
             | TrayCmd::SecondaryActivate { key, .. }
-            | TrayCmd::ContextMenu { key, .. }
+            | TrayCmd::OpenMenu { key, .. }
+            | TrayCmd::MenuClicked { key, .. }
             | TrayCmd::Scroll { key, .. } => key.clone(),
         };
         let Some((bus, path)) = registry.lock().unwrap().get(&key).cloned() else {
             continue;
         };
         let conn = conn.clone();
+        let events = events.clone();
         let _ = zbus::block_on(async move {
-            let item = Proxy::new(&conn, bus, path, SNI_IFACE).await?;
             match cmd {
-                TrayCmd::Activate { x, y, .. } => item.call::<_, _, ()>("Activate", &(x, y)).await,
+                TrayCmd::Activate { x, y, .. } => {
+                    let item = Proxy::new(&conn, bus, path, SNI_IFACE).await?;
+                    item.call::<_, _, ()>("Activate", &(x, y)).await
+                }
                 TrayCmd::SecondaryActivate { x, y, .. } => {
+                    let item = Proxy::new(&conn, bus, path, SNI_IFACE).await?;
                     item.call::<_, _, ()>("SecondaryActivate", &(x, y)).await
                 }
-                TrayCmd::ContextMenu { x, y, .. } => {
-                    item.call::<_, _, ()>("ContextMenu", &(x, y)).await
-                }
-                TrayCmd::Scroll {
-                    delta, horizontal, ..
-                } => {
+                TrayCmd::Scroll { delta, horizontal, .. } => {
+                    let item = Proxy::new(&conn, bus, path, SNI_IFACE).await?;
                     let orientation = if horizontal { "horizontal" } else { "vertical" };
                     item.call::<_, _, ()>("Scroll", &(delta, orientation)).await
+                }
+                TrayCmd::OpenMenu { x, y, .. } => {
+                    open_menu(&conn, &events, &bus, &path, &key, x, y).await;
+                    Ok(())
+                }
+                TrayCmd::MenuClicked { id, .. } => {
+                    menu_clicked(&conn, &bus, &path, id).await;
+                    Ok(())
                 }
             }
         });
     }
+}
+
+/// Fetch an item's dbusmenu layout and send it to the WM as `TrayEvent::Menu`.
+/// If the item exposes no menu, fall back to the SNI `ContextMenu` method so a
+/// non-appindicator item can still respond to a right-click.
+async fn open_menu(
+    conn: &Connection,
+    events: &Sender<TrayEvent>,
+    bus: &str,
+    sni_path: &str,
+    key: &str,
+    x: i32,
+    y: i32,
+) {
+    // The dbusmenu object path lives on the SNI item's `Menu` property.
+    let menu_path = match Proxy::new(conn, bus.to_string(), sni_path.to_string(), SNI_IFACE).await {
+        Ok(item) => item
+            .get_property::<OwnedObjectPath>("Menu")
+            .await
+            .ok()
+            .map(|p| p.as_str().to_string()),
+        Err(_) => None,
+    };
+    let menu_path = match menu_path {
+        Some(p) if p != "/" => p,
+        _ => {
+            // No dbusmenu → let the app pop its own menu (best effort; most
+            // appindicator apps ignore this, but native SNI items honor it).
+            if let Ok(item) = Proxy::new(conn, bus.to_string(), sni_path.to_string(), SNI_IFACE).await
+            {
+                let _ = item.call::<_, _, ()>("ContextMenu", &(x, y)).await;
+            }
+            return;
+        }
+    };
+
+    let menu = match Proxy::new(conn, bus.to_string(), menu_path, DBUSMENU_IFACE).await {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("sfwm: tray: can't proxy dbusmenu for {key}: {e}");
+            return;
+        }
+    };
+    // Give the app a chance to (re)populate the menu before we read it.
+    let _ = menu.call::<_, _, bool>("AboutToShow", &(0i32,)).await;
+    let layout: (u32, OwnedValue) = match menu
+        .call("GetLayout", &(0i32, -1i32, Vec::<&str>::new()))
+        .await
+    {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("sfwm: tray: GetLayout failed for {key}: {e}");
+            return;
+        }
+    };
+    let Some(root) = parse_menu_value(&layout.1) else {
+        eprintln!("sfwm: tray: unparseable menu layout for {key}");
+        return;
+    };
+    eprintln!("sfwm: tray: menu for {key}: {} top-level items", root.children.len());
+    let _ = events.send(TrayEvent::Menu {
+        key: key.to_string(),
+        x,
+        y,
+        items: root.children,
+    });
+}
+
+/// Tell the app a leaf menu row was activated (dbusmenu `Event(id,"clicked")`).
+async fn menu_clicked(conn: &Connection, bus: &str, sni_path: &str, id: i32) {
+    let menu_path = match Proxy::new(conn, bus.to_string(), sni_path.to_string(), SNI_IFACE).await {
+        Ok(item) => item
+            .get_property::<OwnedObjectPath>("Menu")
+            .await
+            .ok()
+            .map(|p| p.as_str().to_string()),
+        Err(_) => None,
+    };
+    let Some(menu_path) = menu_path.filter(|p| p != "/") else {
+        return;
+    };
+    if let Ok(menu) = Proxy::new(conn, bus.to_string(), menu_path, DBUSMENU_IFACE).await {
+        // data is an (ignored) empty variant; timestamp 0 is universally accepted.
+        let _ = menu
+            .call::<_, _, ()>("Event", &(id, "clicked", Value::from(0i32), 0u32))
+            .await;
+    }
+}
+
+// --- dbusmenu layout parsing -------------------------------------------------
+
+fn menu_as_str(v: &Value) -> Option<String> {
+    match v {
+        Value::Str(s) => Some(s.as_str().to_string()),
+        _ => None,
+    }
+}
+fn menu_as_bool(v: &Value) -> Option<bool> {
+    match v {
+        Value::Bool(b) => Some(*b),
+        _ => None,
+    }
+}
+fn menu_as_i32(v: &Value) -> Option<i32> {
+    match v {
+        Value::I32(i) => Some(*i),
+        Value::I16(i) => Some(*i as i32),
+        Value::U32(i) => Some(*i as i32),
+        Value::U8(i) => Some(*i as i32),
+        _ => None,
+    }
+}
+
+/// Strip GNOME/GTK mnemonic underscores from a label: a lone `_` is dropped, a
+/// doubled `__` becomes a literal `_`.
+fn strip_mnemonics(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    let mut chars = label.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '_' {
+            if chars.peek() == Some(&'_') {
+                out.push('_');
+                chars.next();
+            }
+            // else: a mnemonic marker — drop it.
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Resolve a menu row's `icon-name` to a decoded icon (reusing the tray icon
+/// theme search). `icon-data` blobs aren't supported — appindicator menus that
+/// carry icons use `icon-name` in practice.
+fn menu_icon(name: Option<String>) -> Option<TrayIcon> {
+    let name = name.filter(|s| !s.is_empty())?;
+    if name.starts_with('/') {
+        return decode_file(Path::new(&name));
+    }
+    find_icon_file(&name, "").and_then(|p| decode_file(&p))
+}
+
+/// Parse one dbusmenu layout item `(i32 id, a{sv} props, av children)` into a
+/// `MenuNode`, recursively. `v` may be the structure directly or a one-layer
+/// variant wrapping it (children come wrapped). Returns None for a non-structure.
+fn parse_menu_value(v: &Value) -> Option<MenuNode> {
+    let v = match v {
+        Value::Value(inner) => inner.as_ref(),
+        other => other,
+    };
+    let s = match v {
+        Value::Structure(s) => s,
+        _ => return None,
+    };
+    let fields = s.fields();
+    if fields.len() < 3 {
+        return None;
+    }
+    let id = menu_as_i32(&fields[0]).unwrap_or(0);
+
+    // Properties: a{sv}. Unwrap each value's variant layer as we collect it.
+    let mut props: HashMap<String, &Value> = HashMap::new();
+    if let Value::Dict(d) = &fields[1] {
+        for (k, val) in d.iter() {
+            if let Value::Str(k) = k {
+                let val = match val {
+                    Value::Value(inner) => inner.as_ref(),
+                    other => other,
+                };
+                props.insert(k.as_str().to_string(), val);
+            }
+        }
+    }
+    let get = |k: &str| props.get(k).copied();
+
+    let typ = get("type").and_then(menu_as_str).unwrap_or_default();
+    let toggle_type = match get("toggle-type").and_then(menu_as_str).as_deref() {
+        Some("checkmark") => 1u8,
+        Some("radio") => 2u8,
+        _ => 0u8,
+    };
+
+    // Children: av (array of variant-wrapped items).
+    let mut children = Vec::new();
+    if let Value::Array(a) = &fields[2] {
+        for c in a.inner() {
+            if let Some(n) = parse_menu_value(c) {
+                children.push(n);
+            }
+        }
+    }
+
+    Some(MenuNode {
+        id,
+        label: strip_mnemonics(&get("label").and_then(menu_as_str).unwrap_or_default()),
+        enabled: get("enabled").and_then(menu_as_bool).unwrap_or(true),
+        visible: get("visible").and_then(menu_as_bool).unwrap_or(true),
+        is_separator: typ == "separator",
+        has_submenu: get("children-display").and_then(menu_as_str).as_deref() == Some("submenu"),
+        toggle_type,
+        toggle_state: get("toggle-state").and_then(menu_as_i32).unwrap_or(-1),
+        icon: menu_icon(get("icon-name").and_then(menu_as_str)),
+        children,
+    })
 }
