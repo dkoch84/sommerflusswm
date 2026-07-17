@@ -1,0 +1,47 @@
+# Maintainer: the sommerflusswm authors
+# Separate package: the appearance GUI (wallpaper browser + icon-theme picker).
+# Split out from `sommerflusswm` so the window manager doesn't drag in the
+# eframe/egui/OpenGL stack. (Formerly sommerflusswm-wallpaper.)
+pkgname=sommerflusswm-appearance
+pkgver=0.1.0
+pkgrel=2
+pkgdesc="sommerflusswm appearance GUI: wallpaper browser + icon-theme picker (drives 'sc wallpaper' and qt6ct)"
+arch=('x86_64')
+url="https://github.com/dkoch84/sommerflusswm"
+license=('GPL3')
+# Replaces the old wallpaper-only package name.
+replaces=('sommerflusswm-wallpaper')
+conflicts=('sommerflusswm-wallpaper')
+# Needs `sc` from sommerflusswm (it shells out to `sc wallpaper`); that package
+# pulls in river, which already provides the OpenGL/Wayland runtime eframe needs.
+depends=('sommerflusswm')
+makedepends=('rust' 'cargo')
+options=('!debug')
+# Built from the same workspace tarball as the main package (extracts to
+# sommerflusswm-$pkgver/); the build step compiles only the sfwm-appearance crate.
+_srcname="sommerflusswm-$pkgver"
+source=("$_srcname.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+    cd "$srcdir/$_srcname"
+    export CARGO_HOME="$srcdir/cargo-home"
+    cargo fetch --locked
+}
+
+build() {
+    cd "$srcdir/$_srcname"
+    export CARGO_HOME="$srcdir/cargo-home"
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release -p sfwm-appearance
+}
+
+package() {
+    cd "$srcdir/$_srcname"
+    install -Dm755 target/release/sfwm-appearance "$pkgdir/usr/bin/sfwm-appearance"
+    # .desktop entry so the app shows up in the sfwm launcher (drun enumerates
+    # /usr/share/applications) and any other menu.
+    install -Dm644 sfwm-appearance/sfwm-appearance.desktop \
+        "$pkgdir/usr/share/applications/sfwm-appearance.desktop"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

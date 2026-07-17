@@ -1,0 +1,35 @@
+[package]
+name = "sfwm-appearance"
+version = "0.1.0"
+edition = "2021"
+description = "sommerflusswm appearance GUI — wallpaper browser + icon-theme picker (drives `sc wallpaper` and qt6ct)"
+
+[[bin]]
+name = "sfwm-appearance"
+path = "src/main.rs"
+
+[dependencies]
+# eframe/egui on the glow (OpenGL) backend so it runs under llvmpipe software GL on
+# the GPU-less test VM. We explicitly avoid the wgpu backend (needs Vulkan). Wayland
+# is the primary target; x11 is kept on for portability. No GTK/portal/rfd anywhere.
+eframe = { version = "0.31", default-features = false, features = [
+    "glow",
+    "wayland",
+    "x11",
+    "default_fonts",
+] }
+# egui itself, version-matched to eframe (eframe re-exports it, but we use the
+# types directly so we depend on it explicitly for a clean `egui::` path).
+egui = "0.31"
+# Thumbnail decode/downscale (same crate + feature set as sfwm uses for wallpapers).
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "webp",
+    "bmp",
+    "gif",
+] }
+# SVG rasterization for the Icons tab (Papirus/Adwaita ship SVG-only icons).
+# resvg re-exports `usvg` and `tiny_skia`, so it's the only dep we need; we
+# render to a tiny-skia Pixmap and read premultiplied RGBA. No GTK/librsvg.
+resvg = "0.47"

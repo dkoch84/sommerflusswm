@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=sfwm Appearance
+GenericName=Appearance Settings
+Comment=Set the sommerflusswm wallpaper and icon theme
+Exec=sfwm-appearance
+Icon=preferences-desktop-wallpaper
+Terminal=false
+Categories=Settings;DesktopSettings;
+Keywords=wallpaper;background;icons;theme;appearance;sommerflusswm;sfwm;
