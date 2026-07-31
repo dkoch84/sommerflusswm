@@ -103,6 +103,8 @@ sc set window_gap 8
 sc set border_width 2
 sc set border_color_active '#4e9bcf'
 sc set border_color_normal  '#1d252b'
+# dim unfocused windows in-WM (replaces picom's inactive-dim); 0 disables
+sc set inactive_dim 0.07
 
 # --- multi-monitor setup (optional; uncomment + edit rects for your displays) ---
 # sfwm auto-detects one monitor per output by default. To define VIRTUAL monitors
