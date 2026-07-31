@@ -182,10 +182,10 @@ sep() { sc bar add separator size=10 style=empty; }
 full_bar() { # $1 = monitor index
 sc bar create top mon=$1 height=28 marginx=8 marginy=8 bg='#f7f8f3' fg='#1d252b' font=13
 sc bar add executor \
-  "f(){ sc tag_status $1 | tr '\t' '\n' | sed -n 's/^#//p'; }; f; sc --idle | while read -r _; do f; done" \
+  "f(){ sc tag_status | tr '\t' '\n' | sed -n 's/^#//p'; }; f; sc --idle | while read -r _; do f; done" \
   continuous family="$TEXT" bg='#db7681' fg='#f8f7f3' pad=12
 sc bar add executor \
-  "f(){ sc tag_status $1 | tr '\t' '\n' | sed -E 's/[0-9]+//' | grep . | paste -sd' '; }; f; sc --idle | while read -r _; do f; done" \
+  "f(){ sc tag_status | tr '\t' '\n' | sed -E 's/[0-9]+//' | grep . | paste -sd' '; }; f; sc --idle | while read -r _; do f; done" \
   continuous family="$TEXT" pad=8
 
 sc bar add spacer

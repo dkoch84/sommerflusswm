@@ -1815,8 +1815,10 @@ fn list_keybinds(state: &State) -> String {
 
 /// `tag_status [monitor]` — a panel-friendly view of tags 1..9 for the given
 /// monitor (default: focused). Each entry is `<prefix><tag>`, tab-separated:
-///   `#` focused here · `%` visible on another monitor · `!` urgent ·
-///   `:` occupied (has windows) · `.` empty.
+///   `#` the active tag (on the queried monitor) · `!` urgent ·
+///   `-` visible on another monitor · `:` occupied (has windows) · `.` empty.
+/// A tag shown only on a tag-locked overlay monitor (float1/float2) counts as
+/// visible only while it has windows — an idle empty scratchpad reads `.`.
 fn tag_status(state: &State, rest: &[String]) -> String {
     let mon_idx = match rest.first() {
         Some(s) => state.monitors.resolve(&MonitorSel::parse(s)).unwrap_or(state.monitors.focus),
@@ -1827,13 +1829,19 @@ fn tag_status(state: &State, rest: &[String]) -> String {
     for tag in 1..=9u32 {
         let occupied = state.tags.get(&tag).map_or(false, |t| !t.all_windows().is_empty());
         let urgent = state.windows.values().any(|w| w.tag == tag && w.urgent);
-        let visible = state.monitors.tag_visible(tag);
+        // "visible" for the panel: shown on a regular monitor, or on a locked
+        // overlay that actually has content.
+        let visible = state
+            .monitors
+            .list
+            .iter()
+            .any(|m| m.tag == tag && (m.locked_tag.is_none() || occupied));
         let prefix = if Some(tag) == cur_tag {
             '#'
         } else if urgent {
             '!'
         } else if visible {
-            '%'
+            '-'
         } else if occupied {
             ':'
         } else {

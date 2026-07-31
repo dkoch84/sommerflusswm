@@ -178,6 +178,11 @@ impl Config {
 
     /// Record/replace the saved selection for `monitor`.
     pub fn set_saved(&mut self, monitor: &str, saved: Saved) {
+        // A save for "all" supersedes any per-monitor entries — otherwise stale
+        // per-monitor lines linger and --restore re-applies them over it.
+        if monitor == "all" {
+            self.saved.clear();
+        }
         self.saved.insert(monitor.to_string(), saved);
     }
 
