@@ -36,9 +36,26 @@ to_box() {
 geo=""
 case "$mode" in
     gui)
-        command -v slurp >/dev/null || { echo "screenshot.sh: slurp missing" >&2; exit 1; }
         # Feed sfwm's visible window rects so a click snaps to a window.
-        geo=$(sc list_geometry | slurp) || exit 0   # Esc = cancel
+        # slurp segfaults under river on some setups (cursor-theme path); treat
+        # a crash (rc >= 128, killed by signal) as "no slurp" and fall back to
+        # a flameshot-style frozen fullscreen in satty, cropping there instead.
+        if command -v slurp >/dev/null; then
+            geo=$(sc list_geometry | slurp)
+            rc=$?
+            if [ $rc -eq 0 ]; then
+                :
+            elif [ $rc -lt 128 ]; then
+                exit 0   # Esc = cancel
+            else
+                geo=""   # crashed → fullscreen crop fallback
+            fi
+        fi
+        if [[ -z "$geo" ]]; then
+            grim - | satty --filename - --fullscreen --early-exit \
+                --init-tool crop --copy-command wl-copy --output-filename "$out"
+            exit $?
+        fi
         ;;
     window)
         geo=$(to_box "$(sc get_attr clients.focus.geometry)") || {
