@@ -2793,6 +2793,7 @@ dependencies = [
  "input",
  "libc",
  "resvg",
+ "serde",
  "wayland-backend",
  "wayland-client",
  "wayland-protocols",

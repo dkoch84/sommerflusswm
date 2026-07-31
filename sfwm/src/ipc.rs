@@ -149,7 +149,7 @@ pub(crate) fn dispatch(state: &mut State, args: &[String]) -> String {
         "floating_geometry" => cmd_floating_geometry(state, rest),
         "dock" => cmd_dock(state, rest),
         "bar" => cmd_bar(state, rest),
-        "tray" => cmd_tray(state),
+        "tray" => cmd_tray(state, rest),
         "wallpaper" => cmd_wallpaper(state, rest),
         "launcher" => {
             state.open_launcher();
@@ -1052,9 +1052,32 @@ fn cmd_dock(state: &mut State, rest: &[String]) -> String {
     ok()
 }
 
-/// `tray` — dump the WM's current SNI tray state (a diagnostic). Also whether the
-/// bar has a `tray` module to draw them in, since the two are independent.
-fn cmd_tray(state: &State) -> String {
+/// `tray [activate|secondary|menu <key>]` — with no args, dump the WM's current
+/// SNI tray state (a diagnostic; also whether the bar has a `tray` module).
+/// With a subcommand, drive a tray item as if its icon were clicked — lets the
+/// full click path be exercised from a terminal/SSH.
+fn cmd_tray(state: &State, rest: &[String]) -> String {
+    if let Some(verb @ ("activate" | "secondary" | "menu")) = rest.first().map(|s| s.as_str()) {
+        let Some(key) = rest.get(1).cloned().or_else(|| {
+            // Default to the only item when unambiguous.
+            (state.tray_items.len() == 1).then(|| state.tray_items[0].key.clone())
+        }) else {
+            return err("tray: expected <key> (see `sc tray` for keys)");
+        };
+        let Some(tx) = state.tray_cmd.as_ref() else {
+            return err("tray: no tray thread");
+        };
+        let (x, y) = (0, 0);
+        let cmd = match verb {
+            "activate" => crate::tray::TrayCmd::Activate { key: key.clone(), x, y },
+            "secondary" => crate::tray::TrayCmd::SecondaryActivate { key: key.clone(), x, y },
+            _ => crate::tray::TrayCmd::OpenMenu { key: key.clone(), x, y },
+        };
+        return match tx.send(cmd) {
+            Ok(()) => ok(),
+            Err(e) => err(&format!("tray: command channel dead: {e}")),
+        };
+    }
     let has_module = state.bar.as_ref().is_some_and(|b| {
         b.modules
             .iter()

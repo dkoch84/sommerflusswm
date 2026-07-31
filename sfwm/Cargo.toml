@@ -36,3 +36,5 @@ resvg = "0.47"
 # directly (udev backend; user must be in the `input` group).
 input = "0.9"
 libc = "0.2"
+# Typed D-Bus structs (dbusmenu GetLayout reply); already in the tree via zbus.
+serde = { version = "1", features = ["derive"] }

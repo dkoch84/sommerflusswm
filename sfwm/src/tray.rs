@@ -28,6 +28,15 @@ use zbus::object_server::SignalContext;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, Proxy};
 
+/// Raw dbusmenu layout node as it appears on the wire: (id, properties,
+/// children-as-variants). Signature "(ia{sv}av)".
+#[derive(serde::Deserialize, zbus::zvariant::Type)]
+struct RawLayout(
+    #[allow(dead_code)] i32,
+    #[allow(dead_code)] HashMap<String, OwnedValue>,
+    Vec<OwnedValue>,
+);
+
 /// Message from the tray thread to the WM main thread.
 pub enum TrayEvent {
     /// An item appeared or changed. Full snapshot each time (KISS — main replaces).
@@ -843,7 +852,9 @@ async fn open_menu(
     };
     // Give the app a chance to (re)populate the menu before we read it.
     let _ = menu.call::<_, _, bool>("AboutToShow", &(0i32,)).await;
-    let layout: (u32, OwnedValue) = match menu
+    // GetLayout returns (u revision, (ia{sv}av) layout) — the layout is a BARE
+    // struct, not a variant, so it needs a typed target ("uv" fails to match).
+    let layout: (u32, RawLayout) = match menu
         .call("GetLayout", &(0i32, -1i32, Vec::<&str>::new()))
         .await
     {
@@ -853,17 +864,16 @@ async fn open_menu(
             return;
         }
     };
-    let Some(root) = parse_menu_value(&layout.1) else {
-        eprintln!("sfwm: tray: unparseable menu layout for {key}");
-        return;
-    };
-    eprintln!("sfwm: tray: menu for {key}: {} top-level items", root.children.len());
-    let _ = events.send(TrayEvent::Menu {
-        key: key.to_string(),
-        x,
-        y,
-        items: root.children,
-    });
+    // The root node is just a container; its `av` children are the menu entries
+    // (each a variant wrapping the same struct shape, which the parser handles).
+    let items: Vec<MenuNode> = layout
+        .1
+         .2
+        .iter()
+        .filter_map(|v| parse_menu_value(v))
+        .collect();
+    eprintln!("sfwm: tray: menu for {key}: {} top-level items", items.len());
+    let _ = events.send(TrayEvent::Menu { key: key.to_string(), x, y, items });
 }
 
 /// Tell the app a leaf menu row was activated (dbusmenu `Event(id,"clicked")`).

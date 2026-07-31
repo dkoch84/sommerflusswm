@@ -1879,7 +1879,10 @@ impl State {
                     self.tray_items.push(item);
                 }
             }
-            tray::TrayEvent::Remove(key) => self.tray_items.retain(|i| i.key != key),
+            tray::TrayEvent::Remove(key) => {
+                eprintln!("sfwm: tray: item removed from WM: {key}");
+                self.tray_items.retain(|i| i.key != key);
+            }
             tray::TrayEvent::Menu { key, x, y, items } => {
                 self.open_tray_menu(key, items, (x, y));
                 return; // open_tray_menu already requested a manage
