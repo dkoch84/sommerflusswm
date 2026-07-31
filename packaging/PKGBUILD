@@ -1,7 +1,7 @@
 # Maintainer: the sommerflusswm authors
 pkgname=sommerflusswm
 pkgver=0.1.0
-pkgrel=30
+pkgrel=31
 pkgdesc="herbstluftwm successor on river: sfwm window manager + sc control client (monitors, keybinds, frame tree, fullscreen/float/mouse/rules/borders/bar/wallpaper)"
 arch=('x86_64')
 url="https://github.com/dkoch84/sommerflusswm"
@@ -10,6 +10,7 @@ license=('GPL3')
 # wayland provides libwayland-client.so (dlopened); libxkbcommon resolves key names.
 # libinput backs the native touchpad gestures (read directly; user in `input` group).
 depends=('river' 'wayland' 'libxkbcommon' 'libinput')
+optdepends=('sommerflusswm-appearance: GUI wallpaper browser + icon-theme picker')
 makedepends=('rust' 'cargo')
 options=('!debug')
 source=("$pkgname-$pkgver.tar.gz")
