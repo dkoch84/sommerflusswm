@@ -1202,6 +1202,41 @@ impl State {
         w.floating || self.floating_tags.contains(&w.tag)
     }
 
+    /// After a float move-drag ends: if the window's centre now sits on a
+    /// monitor showing a different tag, move the window to that tag (raised
+    /// overlays win over the base monitor beneath them).
+    fn retag_float_to_drop_monitor(&mut self, wid: WinId) {
+        let Some((geo, old_tag)) = self.windows.get(&wid).map(|w| (w.float_geo, w.tag)) else {
+            return;
+        };
+        let (cx, cy) = (geo.x + geo.w / 2, geo.y + geo.h / 2);
+        let Some(new_tag) = self
+            .monitors
+            .list
+            .iter()
+            .filter(|m| {
+                cx >= m.rect.x
+                    && cx < m.rect.x + m.rect.w
+                    && cy >= m.rect.y
+                    && cy < m.rect.y + m.rect.h
+            })
+            .max_by_key(|m| m.z)
+            .map(|m| m.tag)
+        else {
+            return;
+        };
+        if new_tag == old_tag {
+            return;
+        }
+        if let Some(t) = self.tags.get_mut(&old_tag) {
+            t.remove_window(wid);
+        }
+        self.tag_tree_mut(new_tag).insert_window(wid);
+        if let Some(w) = self.windows.get_mut(&wid) {
+            w.tag = new_tag;
+        }
+    }
+
     /// A reasonable default floating rect: centred half-size on the focused monitor.
     fn default_float_geo(&self) -> Rect {
         let a = self.focused_area();
@@ -1449,7 +1484,15 @@ impl State {
         }
         for seat in std::mem::take(&mut self.pending_op_end) {
             seat.op_end();
-            self.op = None;
+            if let Some(op) = self.op.take() {
+                // Dropping a dragged float on another monitor moves it to that
+                // monitor's tag (hlwm behaviour) — so dragging a scratchpad
+                // window between the float overlays "just works" instead of
+                // being snapped back to its old tag's monitor.
+                if !op.resize && !op.tiled {
+                    self.retag_float_to_drop_monitor(op.win);
+                }
+            }
         }
 
         // Plan per-window state from the layout, precomputing outputs/usable rects

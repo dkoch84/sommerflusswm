@@ -109,7 +109,14 @@ fn main() -> std::process::ExitCode {
 fn restore() -> std::process::ExitCode {
     let cfg = Config::load();
     let mut had_error = false;
-    for (mon, saved) in &cfg.saved {
+    // Apply "all" first so per-monitor entries act as overrides on top of it
+    // (BTreeMap order would otherwise run "all" last and clobber them).
+    let ordered = cfg
+        .saved
+        .iter()
+        .filter(|(m, _)| m.as_str() == "all")
+        .chain(cfg.saved.iter().filter(|(m, _)| m.as_str() != "all"));
+    for (mon, saved) in ordered {
         let result = match saved {
             Saved::Image { mode, path } => run_sc(&[path, &format!("mode={mode}"), &format!("monitor={mon}")]),
             Saved::Color { color } => run_sc(&["color", color, &format!("monitor={mon}")]),
