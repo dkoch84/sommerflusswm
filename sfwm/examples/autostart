@@ -173,8 +173,6 @@ sc bar add spacer
 # system tray (SNI/StatusNotifierItem — sfwm is its own tray host; external trays
 # can't composite under sfwm). size=0 auto-fits the bar height. Clicks:
 # left = Activate, middle = SecondaryActivate, right = context menu, scroll = Scroll.
-sc bar add tray size=0 spacing=6
-sep
 
 # right cluster: tint2 panel order (text then icon), separators between groups.
 # NOTE: bar-vim still calls herbstclient on the VM — swap its hc calls to sc, or it
@@ -199,6 +197,8 @@ sc bar add executor "$B/bar-date-icon"                 family="$ICON"
 sep
 sc bar add executor "$B/bar-clock"        interval=60  family="$TEXT"
 sc bar add executor "$B/bar-clock-icon"                family="$ICON"
+sep
+sc bar add tray size=0 spacing=6
 
 # reserve the bar's strip so tiled windows don't sit under it (height + 2*marginy).
 sc pad 0 36 0 0 0

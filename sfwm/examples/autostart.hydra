@@ -178,8 +178,6 @@ sc bar add executor \
 
 sc bar add spacer
 
-sc bar add tray size=0 spacing=6
-sep
 sc bar add executor "$B/bar-weather"      interval=300 family="$TEXT"
 sc bar add executor "$B/bar-weather-icon" interval=300 family='Weather Icons'
 sep
@@ -200,6 +198,8 @@ sc bar add executor "$B/bar-date-icon"                 family="$ICON"
 sep
 sc bar add executor "$B/bar-clock"        interval=60  family="$TEXT"
 sc bar add executor "$B/bar-clock-icon"                family="$ICON"
+sep
+sc bar add tray size=0 spacing=6
 
 # --- RGB ------------------------------------------------------------------------
 liquidctl --match aura set sync color static 5930fc &
