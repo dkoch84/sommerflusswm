@@ -2674,9 +2674,9 @@ impl State {
             self.close_launcher();
             return;
         }
-        if self.apps.is_empty() {
-            self.apps = launcher::enumerate_apps();
-        }
+        // Re-enumerate on every open so freshly installed apps show up without
+        // a restart (it's a quick .desktop directory scan, same as rofi).
+        self.apps = launcher::enumerate_apps();
         let entries: Vec<String> = self.apps.iter().map(|a| a.name.clone()).collect();
         let execs: Vec<String> = self.apps.iter().map(|a| a.exec.clone()).collect();
         self.open_launcher_with(entries, LauncherAction::Apps(execs));

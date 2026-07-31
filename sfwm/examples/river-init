@@ -11,8 +11,20 @@
 # river then reports the resulting geometry to sfwm via river_output_v1.
 
 # Environment for child programs.
+export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-river}"
+export XDG_SESSION_TYPE=wayland
 # export XCURSOR_THEME=...
 # export QT_QPA_PLATFORMTHEME=qt6ct
+
+# Screen sharing / portals: xdg-desktop-portal(-wlr) are D-Bus/systemd-activated
+# and do NOT inherit this session's env — publish it, and stop any stale portal
+# instances so the next request restarts them with the fresh environment.
+# Needs: pacman -S xdg-desktop-portal xdg-desktop-portal-wlr (ScreenCast) — the
+# packaged /usr/share/xdg-desktop-portal/river-portals.conf routes to them.
+dbus-update-activation-environment --systemd \
+    WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE 2>/dev/null
+systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE 2>/dev/null
+systemctl --user stop xdg-desktop-portal xdg-desktop-portal-wlr 2>/dev/null
 
 # Launch the window manager (river advertises river_window_manager_v1 only to it).
 exec sfwm
