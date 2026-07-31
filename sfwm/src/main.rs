@@ -3042,10 +3042,23 @@ fn spawn_autostart(sock: &std::path::Path) {
             });
         cfg.join("sommerflusswm").join("autostart")
     });
-    if !path.exists() {
-        eprintln!("sfwm: no autostart at {} (skipping)", path.display());
-        return;
-    }
+    // No user config → fall back to the packaged example so a fresh install
+    // still comes up with keybinds, bar and wallpaper instead of a black screen.
+    let path = if path.exists() {
+        path
+    } else {
+        let fallback = PathBuf::from("/usr/share/sommerflusswm/autostart");
+        if !fallback.exists() {
+            eprintln!("sfwm: no autostart at {} (skipping)", path.display());
+            return;
+        }
+        eprintln!(
+            "sfwm: no autostart at {} — using packaged default {}",
+            path.display(),
+            fallback.display()
+        );
+        fallback
+    };
     match std::process::Command::new(&path)
         .env("SOMMERFLUSSWM_SOCKET", sock)
         .spawn()

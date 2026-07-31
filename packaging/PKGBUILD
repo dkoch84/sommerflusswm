@@ -48,8 +48,10 @@ package() {
     install -Dm755 sfwm/examples/autostart  "$pkgdir/usr/share/sommerflusswm/autostart"
     install -Dm755 sfwm/examples/river-init  "$pkgdir/usr/share/sommerflusswm/river-init"
 
-    # Login-screen session entry: "sfwm" (starts river, whose init execs sfwm).
+    # Login-screen session entry: "sfwm". The wrapper starts river with the
+    # user's init if present, else the packaged river-init (which execs sfwm).
     install -Dm644 sfwm/examples/sfwm.desktop "$pkgdir/usr/share/wayland-sessions/sfwm.desktop"
+    install -Dm755 sfwm/examples/sfwm-session "$pkgdir/usr/bin/sfwm-session"
 
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"

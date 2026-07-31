@@ -1,0 +1,12 @@
+#!/bin/sh
+# Login-session entry point for sfwm (Exec of sfwm.desktop).
+#
+# river only runs ~/.config/river/init; on a machine with no user config that
+# means a black screen. Use the user's init when it exists, otherwise fall back
+# to the packaged river-init (which just execs sfwm — and sfwm in turn falls
+# back to the packaged autostart when the user has none).
+init="${XDG_CONFIG_HOME:-$HOME/.config}/river/init"
+if [ -x "$init" ]; then
+    exec river
+fi
+exec river -c /usr/share/sommerflusswm/river-init
