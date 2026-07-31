@@ -75,6 +75,7 @@ INPUT BINDINGS
   select_region      native region select: drag, or click a window to snap; prints
                      X,Y WxH (grim -g format); empty + Esc = cancelled
   list_geometry      visible window rects, one X,Y WxH per line
+  cursor_theme <name> [size]   compositor cursor theme + XCURSOR_* for spawns
 
 RULES
   rule [class~re] [app_id=..] [tag=..] [floating=on] [focus=on] [monitor=..] [dock=top] …

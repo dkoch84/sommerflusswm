@@ -32,6 +32,7 @@ use thumbs::ThumbLoader;
 enum Tab {
     Wallpaper,
     Icons,
+    Cursors,
 }
 
 /// Image extensions we show in the grid (compared case-insensitively).
@@ -118,6 +119,13 @@ fn restore() -> std::process::ExitCode {
             had_error = true;
         }
     }
+    if let Some(theme) = &cfg.cursor_theme {
+        let size = cfg.cursor_size.unwrap_or(24).to_string();
+        if let Err(e) = run_sc_raw(&["cursor_theme", theme, &size]) {
+            eprintln!("error: restoring cursor theme: {e}");
+            had_error = true;
+        }
+    }
     if had_error {
         std::process::ExitCode::FAILURE
     } else {
@@ -126,13 +134,19 @@ fn restore() -> std::process::ExitCode {
 }
 
 /// Run `sc wallpaper <args...>`, capturing output.
+fn run_sc(args: &[&str]) -> Result<(), String> {
+    let mut full = vec!["wallpaper"];
+    full.extend_from_slice(args);
+    run_sc_raw(&full)
+}
+
+/// Run `sc <args...>` verbatim, capturing output.
 ///
 /// On success `sc` prints nothing and exits 0 → returns `Ok(())`.
 /// On error `sc` prints `error: ...` to stdout and exits non-zero → returns the
 /// captured message (so the GUI can surface it / `--restore` can log it).
-fn run_sc(args: &[&str]) -> Result<(), String> {
+fn run_sc_raw(args: &[&str]) -> Result<(), String> {
     let mut cmd = Command::new("sc");
-    cmd.arg("wallpaper");
     cmd.args(args);
     let out = cmd
         .output()
@@ -266,6 +280,16 @@ struct App {
     icon_requested: HashSet<IconKey>,
     /// Slots that resolved to nothing / failed to render.
     icon_failed: HashSet<IconKey>,
+
+    // ----- Cursors tab -----
+    /// Installed cursor themes (directory names with a `cursors/` subdir).
+    cursor_themes: Vec<String>,
+    /// Currently selected cursor theme (index into `cursor_themes`).
+    selected_cursor: Option<usize>,
+    /// Cursor size applied with the theme.
+    cursor_size: u32,
+    /// Independent status line for the Cursors tab.
+    cursor_status: String,
 }
 
 impl App {
@@ -299,6 +323,13 @@ impl App {
             .as_deref()
             .and_then(|saved| themes.iter().position(|t| t.dir_name == saved));
 
+        let cursor_themes = find_cursor_themes();
+        let selected_cursor = cfg
+            .cursor_theme
+            .as_deref()
+            .and_then(|saved| cursor_themes.iter().position(|t| t == saved));
+        let cursor_size = cfg.cursor_size.unwrap_or(24);
+
         let mut app = App {
             tab: Tab::Wallpaper,
             cfg,
@@ -324,6 +355,11 @@ impl App {
             icon_texs: HashMap::new(),
             icon_requested: HashSet::new(),
             icon_failed: HashSet::new(),
+
+            cursor_themes,
+            selected_cursor,
+            cursor_size,
+            cursor_status: "Ready.".to_string(),
         };
 
         // Pre-select the first existing directory.
@@ -448,6 +484,140 @@ impl App {
     }
 }
 
+/// XCursor themes: directories under the icon base paths that contain a
+/// `cursors/` subdirectory. Returned as sorted, deduplicated directory names.
+fn find_cursor_themes() -> Vec<String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let bases = [
+        format!("{home}/.icons"),
+        format!("{home}/.local/share/icons"),
+        "/usr/share/icons".to_string(),
+    ];
+    let mut out: Vec<String> = Vec::new();
+    for base in bases {
+        let Ok(entries) = std::fs::read_dir(&base) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.join("cursors").is_dir() {
+                if let Some(name) = p.file_name().map(|n| n.to_string_lossy().to_string()) {
+                    if !out.contains(&name) {
+                        out.push(name);
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by_key(|a| a.to_ascii_lowercase());
+    out
+}
+
+impl App {
+    /// Apply the selected cursor theme via `sc cursor_theme` and persist it.
+    fn apply_cursor_theme(&mut self) {
+        let Some(theme) = self.selected_cursor.and_then(|i| self.cursor_themes.get(i)).cloned()
+        else {
+            self.cursor_status = "No cursor theme selected.".to_string();
+            return;
+        };
+        let size = self.cursor_size.max(1);
+        match run_sc_raw(&["cursor_theme", &theme, &size.to_string()]) {
+            Ok(()) => {
+                self.cfg.set_cursor_theme(&theme, size);
+                match self.cfg.save() {
+                    Ok(()) => {
+                        self.cursor_status = format!("Applied cursor theme {theme} @ {size}px. Saved.")
+                    }
+                    Err(e) => self.cursor_status = format!("error: saving config: {e}"),
+                }
+            }
+            Err(e) => self.cursor_status = format!("error: {e}"),
+        }
+    }
+
+    fn cursors_left_panel(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("cursor-themes")
+            .resizable(false)
+            .exact_width(240.0)
+            .show(ctx, |ui| {
+                ui.heading("Cursor themes");
+                ui.separator();
+                if self.cursor_themes.is_empty() {
+                    ui.label("No cursor themes found.");
+                    return;
+                }
+                let mut select: Option<usize> = None;
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .drag_to_scroll(false)
+                    .show(ui, |ui| {
+                        for (i, name) in self.cursor_themes.iter().enumerate() {
+                            let selected = self.selected_cursor == Some(i);
+                            if ui.selectable_label(selected, name).clicked() {
+                                select = Some(i);
+                            }
+                        }
+                    });
+                if let Some(i) = select {
+                    self.selected_cursor = Some(i);
+                }
+            });
+    }
+
+    fn cursors_bottom_panel(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("cursor-controls").show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_label("Size")
+                    .selected_text(self.cursor_size.to_string())
+                    .show_ui(ui, |ui| {
+                        for s in [16u32, 24, 32, 48, 64] {
+                            ui.selectable_value(&mut self.cursor_size, s, s.to_string());
+                        }
+                    });
+                let can_apply = self.selected_cursor.is_some();
+                if ui.add_enabled(can_apply, egui::Button::new("Apply")).clicked() {
+                    self.apply_cursor_theme();
+                }
+                if let Some(t) = self.selected_cursor.and_then(|i| self.cursor_themes.get(i)) {
+                    ui.label(egui::RichText::new(format!("→ {t}")).weak());
+                }
+            });
+            ui.add_space(2.0);
+            ui.separator();
+            let is_err = self.cursor_status.starts_with("error:");
+            let color = if is_err {
+                egui::Color32::from_rgb(0xff, 0x6b, 0x6b)
+            } else {
+                ui.visuals().text_color()
+            };
+            ui.label(egui::RichText::new(&self.cursor_status).color(color));
+            ui.add_space(2.0);
+        });
+    }
+
+    fn cursors_central_panel(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let Some(theme) = self.selected_cursor.and_then(|i| self.cursor_themes.get(i)) else {
+                ui.centered_and_justified(|ui| {
+                    ui.label("Select a cursor theme on the left.");
+                });
+                return;
+            };
+            ui.heading(theme);
+            ui.add_space(6.0);
+            ui.label("Applies to the compositor cursor immediately (sc cursor_theme).");
+            ui.label("Running apps pick the theme up when restarted; new apps inherit it.");
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(
+                    "Saved to wallpaper.conf and re-applied at login by sfwm-appearance --restore.",
+                )
+                .weak(),
+            );
+        });
+    }
+}
+
 /// Short label for a path (file name, or the full path if it has none).
 fn file_label(p: &Path) -> String {
     p.file_name()
@@ -466,6 +636,7 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Wallpaper, "Wallpaper");
                 ui.selectable_value(&mut self.tab, Tab::Icons, "Icons");
+                ui.selectable_value(&mut self.tab, Tab::Cursors, "Cursors");
             });
             ui.add_space(2.0);
         });
@@ -480,6 +651,11 @@ impl eframe::App for App {
                 self.icons_left_panel(ctx);
                 self.icons_bottom_panel(ctx);
                 self.icons_central_panel(ctx);
+            }
+            Tab::Cursors => {
+                self.cursors_left_panel(ctx);
+                self.cursors_bottom_panel(ctx);
+                self.cursors_central_panel(ctx);
             }
         }
     }

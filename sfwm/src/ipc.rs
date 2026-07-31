@@ -190,6 +190,29 @@ pub(crate) fn dispatch(state: &mut State, args: &[String]) -> String {
             ok()
         }
         "version" => format!("sommerflusswm {}\n", env!("CARGO_PKG_VERSION")),
+        // `cursor_theme <name> [size]` — compositor-rendered cursors via the
+        // seat (river v2+), plus XCURSOR_* env so spawned clients match.
+        "cursor_theme" => {
+            let Some(name) = rest.first() else {
+                return err("cursor_theme: expected <name> [size]");
+            };
+            let size: u32 = rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(24);
+            use wayland_client::Proxy as _;
+            let mut applied = false;
+            for seat in &state.seats {
+                if seat.version() >= 2 {
+                    seat.set_xcursor_theme(name.clone(), size);
+                    applied = true;
+                }
+            }
+            std::env::set_var("XCURSOR_THEME", name);
+            std::env::set_var("XCURSOR_SIZE", size.to_string());
+            if applied {
+                ok()
+            } else {
+                err("cursor_theme: river too old (seat v2 needed for compositor cursors)")
+            }
+        }
         // hlwm setenv/getenv: env of the WM process, inherited by everything
         // `spawn`ed (exports in the autostart script do NOT reach spawns).
         "setenv" => {

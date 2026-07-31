@@ -43,6 +43,11 @@ pub struct Config {
     /// `Papirus-Dark`). Only used to pre-select in the Icons tab; the actual
     /// applied value lives in `qt6ct.conf`.
     pub icon_theme: Option<String>,
+    /// The last chosen cursor theme (directory name) — applied via
+    /// `sc cursor_theme` on save and on `--restore`.
+    pub cursor_theme: Option<String>,
+    /// Cursor size for the theme above (defaults to 24).
+    pub cursor_size: Option<u32>,
 }
 
 /// Resolve `~/.config/sommerflusswm/wallpaper.conf` via `$HOME`.
@@ -118,6 +123,16 @@ impl Config {
                         cfg.icon_theme = Some(rest.to_string());
                     }
                 }
+                "cursor-theme" => {
+                    if !rest.is_empty() {
+                        cfg.cursor_theme = Some(rest.to_string());
+                    }
+                }
+                "cursor-size" => {
+                    if let Ok(n) = rest.parse::<u32>() {
+                        cfg.cursor_size = Some(n);
+                    }
+                }
                 _ => { /* ignore unknown directives for forward-compat */ }
             }
         }
@@ -150,6 +165,12 @@ impl Config {
         if let Some(theme) = &self.icon_theme {
             out.push_str(&format!("icon-theme {theme}\n"));
         }
+        if let Some(theme) = &self.cursor_theme {
+            out.push_str(&format!("cursor-theme {theme}\n"));
+        }
+        if let Some(size) = self.cursor_size {
+            out.push_str(&format!("cursor-size {size}\n"));
+        }
         let mut f = fs::File::create(&path)?;
         f.write_all(out.as_bytes())?;
         Ok(())
@@ -161,6 +182,11 @@ impl Config {
     }
 
     /// Record the last chosen icon theme (its directory name).
+    pub fn set_cursor_theme(&mut self, dir_name: &str, size: u32) {
+        self.cursor_theme = Some(dir_name.to_string());
+        self.cursor_size = Some(size);
+    }
+
     pub fn set_icon_theme(&mut self, dir_name: &str) {
         self.icon_theme = Some(dir_name.to_string());
     }

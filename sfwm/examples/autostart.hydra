@@ -177,29 +177,16 @@ TEXT='Iosevka Term'
 ICON='Font Awesome 7 Free Solid'
 sep() { sc bar add separator size=10 style=empty; }
 
-# Slim bars on the portraits + top 4K: that monitor's tag indicators + clock.
-tag_box() { # $1 = monitor index
-  sc bar add executor \
-    "f(){ sc tag_status $1 | tr '\t' '\n' | sed -n 's/^#//p'; }; f; sc --idle | while read -r _; do f; done" \
-    continuous family="$TEXT" bg='#db7681' fg='#f8f7f3' pad=12
-  sc bar add executor \
-    "f(){ sc tag_status $1 | tr '\t' '\n' | sed -E 's/[0-9]+//' | grep . | paste -sd' '; }; f; sc --idle | while read -r _; do f; done" \
-    continuous family="$TEXT" pad=8
-}
-for m in 0 2 3; do
-  sc bar create top mon=$m height=28 marginx=8 marginy=8 bg='#f7f8f3' fg='#1d252b' font=13
-  tag_box $m
-  sc bar add spacer
-  sc bar add executor "$B/bar-date"       interval=500 family="$TEXT"
-  sc bar add executor "$B/bar-date-icon"               family="$ICON"
-  sep
-  sc bar add executor "$B/bar-clock"      interval=60  family="$TEXT"
-  sc bar add executor "$B/bar-clock-icon"              family="$ICON"
-done
-
-# Main 4K (mon 1): the full tint2-style cluster + tray.
-sc bar create top mon=1 height=28 marginx=8 marginy=8 bg='#f7f8f3' fg='#1d252b' font=13
-tag_box 1
+# The full tint2-style cluster + tray, on every monitor. Each bar's tag box
+# tracks ITS monitor (sc tag_status $m).
+full_bar() { # $1 = monitor index
+sc bar create top mon=$1 height=28 marginx=8 marginy=8 bg='#f7f8f3' fg='#1d252b' font=13
+sc bar add executor \
+  "f(){ sc tag_status $1 | tr '\t' '\n' | sed -n 's/^#//p'; }; f; sc --idle | while read -r _; do f; done" \
+  continuous family="$TEXT" bg='#db7681' fg='#f8f7f3' pad=12
+sc bar add executor \
+  "f(){ sc tag_status $1 | tr '\t' '\n' | sed -E 's/[0-9]+//' | grep . | paste -sd' '; }; f; sc --idle | while read -r _; do f; done" \
+  continuous family="$TEXT" pad=8
 
 sc bar add spacer
 
@@ -225,6 +212,8 @@ sc bar add executor "$B/bar-clock"        interval=60  family="$TEXT"
 sc bar add executor "$B/bar-clock-icon"                family="$ICON"
 sep
 sc bar add tray size=0 spacing=6
+}
+for m in 0 1 2 3; do full_bar "$m"; done
 
 # --- RGB ------------------------------------------------------------------------
 liquidctl --match aura set sync color static 5930fc &
