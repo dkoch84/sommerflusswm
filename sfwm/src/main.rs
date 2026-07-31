@@ -1894,6 +1894,7 @@ impl State {
     fn open_tray_menu(&mut self, key: String, items: Vec<tray::MenuNode>, anchor: (i32, i32)) {
         self.close_tray_menu();
         if items.iter().all(|n| !n.visible) {
+            eprintln!("sfwm: tray: menu for {key} has no visible items; not opening");
             return;
         }
         let (Some(comp), Some(wm)) = (self.compositor.clone(), self.wm.clone()) else {

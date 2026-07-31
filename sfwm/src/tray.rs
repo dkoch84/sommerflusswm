@@ -767,6 +767,7 @@ fn command_loop(conn: Connection, registry: Registry, events: Sender<TrayEvent>,
             | TrayCmd::Scroll { key, .. } => key.clone(),
         };
         let Some((bus, path)) = registry.lock().unwrap().get(&key).cloned() else {
+            eprintln!("sfwm: tray: command for unknown item '{key}' (not in registry)");
             continue;
         };
         let conn = conn.clone();
