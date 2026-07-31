@@ -745,7 +745,9 @@ struct State {
     /// Shared-memory global, for drawing the status bar (and later overlays).
     shm: Option<WlShm>,
     /// The WM-drawn status bar, once `sc bar create` has made it.
-    bar: Option<Bar>,
+    bars: Vec<Bar>,
+    /// Index into `bars` that `bar add` appends to (the last `bar create`d).
+    bar_current: usize,
     /// Per-monitor wallpapers (`sc wallpaper`), keyed by monitor index.
     wallpapers: HashMap<usize, Wallpaper>,
     /// calloop handle, stored so bar executors can be (de)registered after the
@@ -786,7 +788,7 @@ struct State {
     /// is how bar executors and tray icons get their clicks.
     wl_pointer: Option<WlPointer>,
     /// True while the pointer is over the bar's surface (wl_pointer Enter/Leave).
-    pointer_over_bar: bool,
+    pointer_over_bar: Option<usize>,
     /// Latest surface-local pointer position over the bar (wl_pointer Enter/Motion).
     bar_pointer: (i32, i32),
     /// Last pointer button pressed (evdev code), so the `shell_surface_interaction`
@@ -1619,7 +1621,9 @@ impl State {
 
         // Draw + place the WM-owned status bar above everything.
         let top_node = stack.last().cloned();
-        self.render_bar(qh, top_node.as_ref());
+        for i in 0..self.bars.len() {
+            self.render_bar_at(qh, top_node.as_ref(), i);
+        }
 
         self.apply_dim(qh, &layout, focused);
 
@@ -1637,9 +1641,9 @@ impl State {
     /// shm buffer only when the size changes; always re-syncs + commits so the
     /// surface lands atomically with `render_finish` (protocol requirement).
     /// `top_node` is the topmost window node, so the bar sits above all windows.
-    fn render_bar(&mut self, qh: &QueueHandle<Self>, top_node: Option<&RiverNodeV1>) {
+    fn render_bar_at(&mut self, qh: &QueueHandle<Self>, top_node: Option<&RiverNodeV1>, idx: usize) {
         let Some(shm) = self.shm.clone() else { return };
-        let bar_mon = self.bar.as_ref().map_or(0, |b| b.mon);
+        let Some(bar_mon) = self.bars.get(idx).map(|b| b.mon) else { return };
         let Some(rect) = self
             .monitors
             .list
@@ -1649,9 +1653,6 @@ impl State {
         else {
             return;
         };
-        if self.bar.is_none() {
-            return;
-        }
         // Build the (expensive) font system once, on first draw.
         if self.font_system.is_none() {
             self.font_system = Some(cosmic_text::FontSystem::new());
@@ -1660,7 +1661,7 @@ impl State {
         // Take the font state out so we can borrow self.bar mutably alongside it.
         let mut fs = self.font_system.take().unwrap();
         let mut sc = self.swash_cache.take().unwrap();
-        let bar = self.bar.as_mut().unwrap();
+        let bar = self.bars.get_mut(idx).unwrap();
 
         let h = bar.height.max(1);
         let w = (rect.w - 2 * bar.margin_x).max(1);
@@ -1825,10 +1826,10 @@ impl State {
     /// whatever module is under the cursor: an executor's `lclick`/`rclick` shell
     /// command, or a tray icon's SNI action (left = Activate, middle =
     /// SecondaryActivate, right = open the dbusmenu overlay).
-    fn bar_click(&mut self, lx: i32, button: u32) {
+    fn bar_click(&mut self, idx: usize, lx: i32, button: u32) {
         const BTN_RIGHT: u32 = 0x111;
         const BTN_MIDDLE: u32 = 0x112;
-        let Some(bar) = self.bar.as_ref() else { return };
+        let Some(bar) = self.bars.get(idx) else { return };
         let (origin, height) = (bar.origin, bar.height);
         let Some(zone) = bar.hit.iter().find(|z| lx >= z.x0 && lx < z.x1) else {
             eprintln!("sfwm: bar: click at x={lx} hit no module ({} zones)", bar.hit.len());
@@ -1842,7 +1843,7 @@ impl State {
         };
         match kind {
             HitKind::Exec(id) => {
-                let cmd = bar.modules.iter().find_map(|m| match m {
+                let cmd = self.bars[idx].modules.iter().find_map(|m| match m {
                     BarModule::Executor(e) if e.id == id => {
                         if button == BTN_RIGHT {
                             e.rclick.clone()
@@ -1883,12 +1884,12 @@ impl State {
     }
 
     /// Route a scroll over the bar to the tray icon under the cursor (SNI `Scroll`).
-    fn bar_scroll(&mut self, axis: wl_pointer::Axis, value: f64) {
+    fn bar_scroll(&mut self, idx: usize, axis: wl_pointer::Axis, value: f64) {
         if value == 0.0 {
             return;
         }
         let lx = self.bar_pointer.0;
-        let key = self.bar.as_ref().and_then(|bar| {
+        let key = self.bars.get(idx).and_then(|bar| {
             bar.hit.iter().find(|z| lx >= z.x0 && lx < z.x1).and_then(|z| match &z.kind {
                 HitKind::Tray(k) => Some(k.clone()),
                 _ => None,
@@ -2271,13 +2272,13 @@ impl State {
     /// the bar channel) and trigger a redraw.
     fn set_bar_module_text(&mut self, id: u64, text: String) {
         let mut found = false;
-        if let Some(bar) = self.bar.as_mut() {
+        'bars: for bar in &mut self.bars {
             for m in &mut bar.modules {
                 if let BarModule::Executor(e) = m {
                     if e.id == id {
                         e.text = text;
                         found = true;
-                        break;
+                        break 'bars;
                     }
                 }
             }
@@ -2362,9 +2363,9 @@ impl State {
         }
     }
 
-    /// Stop every bar executor (kill children / signal threads) and drop modules.
-    fn teardown_bar_modules(&mut self) {
-        if let Some(bar) = self.bar.as_mut() {
+    /// Stop one bar's executors (kill children / signal threads), drop its modules.
+    fn teardown_bar_modules_at(&mut self, idx: usize) {
+        if let Some(bar) = self.bars.get_mut(idx) {
             for m in &mut bar.modules {
                 if let BarModule::Executor(e) = m {
                     e.stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2378,13 +2379,20 @@ impl State {
         }
     }
 
+    /// Stop every bar's executors and drop all modules.
+    fn teardown_bar_modules(&mut self) {
+        for i in 0..self.bars.len() {
+            self.teardown_bar_modules_at(i);
+        }
+    }
+
     /// Fully remove the bar: stop its executors AND destroy its Wayland objects
     /// (node, shell surface, surface, buffers). Wayland proxies are NOT freed on
     /// drop, so without this an `sc bar create` over an existing bar would leak
     /// the old shell surface/node — river keeps compositing a ghost of it.
     fn destroy_bar(&mut self) {
         self.teardown_bar_modules();
-        if let Some(bar) = self.bar.take() {
+        for bar in self.bars.drain(..) {
             if let Some(b) = bar.buffer {
                 b.destroy();
             }
@@ -2395,6 +2403,7 @@ impl State {
             bar.shell.destroy();
             bar.surface.destroy();
         }
+        self.bar_current = 0;
     }
 
     /// Draw each monitor's wallpaper and return their nodes (bottom-most). Rebuilds
@@ -2684,11 +2693,14 @@ impl State {
 
         // Stack top-right, below a top-anchored bar.
         let mut top = MARGIN;
-        if let Some(b) = &self.bar {
-            if matches!(b.anchor, DockAnchor::Top) {
-                top += b.margin_y * 2 + b.height;
-            }
-        }
+        let strip = self
+            .bars
+            .iter()
+            .filter(|b| matches!(b.anchor, DockAnchor::Top))
+            .map(|b| b.margin_y * 2 + b.height)
+            .max()
+            .unwrap_or(0);
+        top += strip;
         let x = rect.x + rect.w - w_box - MARGIN;
         let mut y = rect.y + top;
         for n in self.notifications.iter() {
@@ -3790,7 +3802,8 @@ fn main() {
         spb,
         dim_buffer: None,
         shm,
-        bar: None,
+        bars: Vec::new(),
+        bar_current: 0,
         wallpapers: HashMap::new(),
         loop_handle: None,
         bar_tx: None,
@@ -3811,7 +3824,7 @@ fn main() {
         pointer_over_menu: false,
         menu_pointer: (0, 0),
         wl_pointer: None,
-        pointer_over_bar: false,
+        pointer_over_bar: None,
         bar_pointer: (0, 0),
         last_pointer_button: 0x110, // BTN_LEFT
     };
@@ -4154,19 +4167,13 @@ impl Dispatch<RiverSeatV1, ()> for State {
                     }
                     return;
                 }
-                let is_bar = state
-                    .bar
-                    .as_ref()
-                    .is_some_and(|b| b.shell.id() == ssid);
-                eprintln!(
-                    "sfwm: bar: shell_surface_interaction is_bar={is_bar} over_bar={} pos={:?}",
-                    state.pointer_over_bar, state.pointer_pos
-                );
-                if is_bar && !state.pointer_over_bar {
-                    if let Some(origin) = state.bar.as_ref().map(|b| b.origin) {
+                let bar_idx = state.bars.iter().position(|b| b.shell.id() == ssid);
+                if let Some(bi) = bar_idx {
+                    if state.pointer_over_bar.is_none() {
+                        let origin = state.bars[bi].origin;
                         let lx = state.pointer_pos.0 - origin.0;
                         let button = state.last_pointer_button;
-                        state.bar_click(lx, button);
+                        state.bar_click(bi, lx, button);
                     }
                 }
             }
@@ -4311,9 +4318,11 @@ impl Dispatch<WlPointer, ()> for State {
                         .tray_menu
                         .as_ref()
                         .is_some_and(|m| m.surface.id() == sid);
-                state.pointer_over_bar = !state.pointer_over_region
-                    && !state.pointer_over_menu
-                    && state.bar.as_ref().is_some_and(|b| b.surface.id() == sid);
+                state.pointer_over_bar = if state.pointer_over_region || state.pointer_over_menu {
+                    None
+                } else {
+                    state.bars.iter().position(|b| b.surface.id() == sid)
+                };
                 if state.pointer_over_region {
                     if let Some(r) = state.region.as_mut() {
                         r.cur = (surface_x as i32, surface_y as i32);
@@ -4321,7 +4330,7 @@ impl Dispatch<WlPointer, ()> for State {
                     state.request_manage();
                 } else if state.pointer_over_menu {
                     state.menu_pointer_moved(surface_x as i32, surface_y as i32);
-                } else if state.pointer_over_bar {
+                } else if state.pointer_over_bar.is_some() {
                     state.bar_pointer = (surface_x as i32, surface_y as i32);
                 }
             }
@@ -4333,8 +4342,12 @@ impl Dispatch<WlPointer, ()> for State {
                 if state.tray_menu.as_ref().is_some_and(|m| m.surface.id() == sid) {
                     state.pointer_over_menu = false;
                 }
-                if state.bar.as_ref().is_some_and(|b| b.surface.id() == sid) {
-                    state.pointer_over_bar = false;
+                if state
+                    .pointer_over_bar
+                    .and_then(|i| state.bars.get(i))
+                    .is_some_and(|b| b.surface.id() == sid)
+                {
+                    state.pointer_over_bar = None;
                 }
             }
             Event::Motion { surface_x, surface_y, .. } => {
@@ -4345,7 +4358,7 @@ impl Dispatch<WlPointer, ()> for State {
                     state.request_manage();
                 } else if state.pointer_over_menu {
                     state.menu_pointer_moved(surface_x as i32, surface_y as i32);
-                } else if state.pointer_over_bar {
+                } else if state.pointer_over_bar.is_some() {
                     state.bar_pointer = (surface_x as i32, surface_y as i32);
                 }
             }
@@ -4359,10 +4372,9 @@ impl Dispatch<WlPointer, ()> for State {
                 } else if state.pointer_over_menu {
                     let (mx, my) = state.menu_pointer;
                     state.menu_click(mx, my);
-                } else if state.pointer_over_bar {
-                    eprintln!("sfwm: bar: wl_pointer button={button} over_bar=true");
+                } else if let Some(bi) = state.pointer_over_bar {
                     let lx = state.bar_pointer.0;
-                    state.bar_click(lx, button);
+                    state.bar_click(bi, lx, button);
                 }
             }
             Event::Button {
@@ -4373,8 +4385,8 @@ impl Dispatch<WlPointer, ()> for State {
                 }
             }
             Event::Axis { axis: WEnum::Value(axis), value, .. } => {
-                if state.pointer_over_bar {
-                    state.bar_scroll(axis, value);
+                if let Some(bi) = state.pointer_over_bar {
+                    state.bar_scroll(bi, axis, value);
                 }
             }
             _ => {}

@@ -670,13 +670,50 @@ fn cmd_split(state: &mut State, rest: &[String]) -> String {
     ok()
 }
 
+/// The monitor lying in `dir` from the focused one, if any (hlwm
+/// `focus_crosses_monitor_boundaries`): nearest center strictly beyond the
+/// focused monitor's center in that direction. Base monitors win ties against
+/// raised overlays (float1/float2 share their base's rect).
+fn monitor_in_dir(state: &State, dir: frame::Dir) -> Option<usize> {
+    let cur = state.monitors.list.get(state.monitors.focus)?.rect;
+    let (ccx, ccy) = (cur.x + cur.w / 2, cur.y + cur.h / 2);
+    state
+        .monitors
+        .list
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != state.monitors.focus)
+        .filter_map(|(i, m)| {
+            let (cx, cy) = (m.rect.x + m.rect.w / 2, m.rect.y + m.rect.h / 2);
+            let beyond = match dir {
+                frame::Dir::Left => cx < ccx,
+                frame::Dir::Right => cx > ccx,
+                frame::Dir::Up => cy < ccy,
+                frame::Dir::Down => cy > ccy,
+            };
+            if !beyond {
+                return None;
+            }
+            let (dx, dy) = ((cx - ccx) as i64, (cy - ccy) as i64);
+            Some((i, (dx * dx + dy * dy, m.z)))
+        })
+        .min_by_key(|(_, k)| *k)
+        .map(|(i, _)| i)
+}
+
 fn cmd_focus(state: &mut State, rest: &[String]) -> String {
     let Some(dir) = rest.first().and_then(|s| frame::Dir::parse(s)) else {
         return err("focus: expected left|down|up|right");
     };
     let area = state.focused_area();
     let gap = state.window_gap;
-    state.focused_tree_mut().focus_dir(dir, area, gap);
+    if !state.focused_tree_mut().focus_dir(dir, area, gap) {
+        // At the tree's edge: cross to the monitor in that direction (hlwm
+        // focus_crosses_monitor_boundaries, default on there).
+        if let Some(i) = monitor_in_dir(state, dir) {
+            state.monitors.focus = i;
+        }
+    }
     state.request_manage();
     ok()
 }
@@ -687,7 +724,18 @@ fn cmd_shift(state: &mut State, rest: &[String]) -> String {
     };
     let area = state.focused_area();
     let gap = state.window_gap;
-    state.focused_tree_mut().shift_dir(dir, area, gap);
+    if !state.focused_tree_mut().shift_dir(dir, area, gap) {
+        // At the tree's edge: move the window to the monitor in that direction
+        // and follow it (hlwm shift_crosses_monitor_boundaries).
+        if let Some(i) = monitor_in_dir(state, dir) {
+            let tag = state.monitors.list[i].tag;
+            let reply = move_focused_to_tag(state, tag);
+            if reply.starts_with("error:") {
+                return reply;
+            }
+            state.monitors.focus = i;
+        }
+    }
     state.request_manage();
     ok()
 }
@@ -1095,7 +1143,7 @@ fn cmd_tray(state: &State, rest: &[String]) -> String {
             Err(e) => err(&format!("tray: command channel dead: {e}")),
         };
     }
-    let has_module = state.bar.as_ref().is_some_and(|b| {
+    let has_module = state.bars.iter().any(|b| {
         b.modules
             .iter()
             .any(|m| matches!(m, crate::BarModule::Tray { .. }))
@@ -1142,7 +1190,7 @@ fn cmd_bar(state: &mut State, rest: &[String]) -> String {
 
 /// `bar add <executor|separator|spacer> …` — append a module to the bar.
 fn cmd_bar_add(state: &mut State, args: &[String]) -> String {
-    if state.bar.is_none() {
+    if state.bars.get(state.bar_current).is_none() {
         return err("bar add: no bar yet (run 'bar create' first)");
     }
     match args.first().map(|s| s.as_str()) {
@@ -1171,17 +1219,14 @@ fn cmd_bar_add(state: &mut State, args: &[String]) -> String {
                     return err(&format!("bar add separator: unknown option '{tok}'"));
                 }
             }
-            state
-                .bar
-                .as_mut()
-                .unwrap()
-                .modules
-                .push(BarModule::Separator { size, color, style });
+            let cur = state.bar_current;
+            state.bars[cur].modules.push(BarModule::Separator { size, color, style });
             state.request_manage();
             ok()
         }
         Some("spacer") => {
-            state.bar.as_mut().unwrap().modules.push(BarModule::Spacer);
+            let cur = state.bar_current;
+            state.bars[cur].modules.push(BarModule::Spacer);
             state.request_manage();
             ok()
         }
@@ -1202,12 +1247,8 @@ fn cmd_bar_add(state: &mut State, args: &[String]) -> String {
                     return err(&format!("bar add tray: unknown option '{tok}'"));
                 }
             }
-            state
-                .bar
-                .as_mut()
-                .unwrap()
-                .modules
-                .push(BarModule::Tray { size, spacing });
+            let cur = state.bar_current;
+            state.bars[cur].modules.push(BarModule::Tray { size, spacing });
             state.request_manage();
             ok()
         }
@@ -1267,7 +1308,8 @@ fn cmd_bar_add_executor(state: &mut State, args: &[String]) -> String {
     let child = state.spawn_executor(id, cmd.clone(), mode, stop.clone());
     let exec =
         Executor { id, fg, bg, pad, family, size, lclick, rclick, text: String::new(), stop, child };
-    state.bar.as_mut().unwrap().modules.push(BarModule::Executor(exec));
+    let cur = state.bar_current;
+    state.bars[cur].modules.push(BarModule::Executor(exec));
     state.request_manage();
     ok()
 }
@@ -1344,16 +1386,24 @@ fn cmd_bar_create(state: &mut State, opts: &[String]) -> String {
         }
     }
 
-    // Re-creating over an existing bar: REUSE its shell surface/node instead of
-    // destroy + recreate. river does not reliably composite a freshly re-created
-    // shell surface until the next full render, so `sc reload` (which re-runs
-    // `sc bar create`) made the panel vanish until a tag switch. Reusing keeps the
-    // surface mapped and its buffer on screen; we only stop the old executors and
-    // reset the modules + properties. (`sc bar destroy` still tears it down fully.)
-    state.teardown_bar_modules();
+    // Re-creating over an existing bar ON THE SAME MONITOR: REUSE its shell
+    // surface/node instead of destroy + recreate. river does not reliably
+    // composite a freshly re-created shell surface until the next full render,
+    // so `sc reload` (which re-runs `sc bar create`) made the panel vanish
+    // until a tag switch. Reusing keeps the surface mapped and its buffer on
+    // screen; we only stop the old executors and reset the modules +
+    // properties. A create for a NEW monitor appends another bar — one bar per
+    // monitor. (`sc bar destroy` still tears everything down fully.)
     let qh = state.qh.clone();
-    let (surface, shell, node, buffer, backing, old) = match state.bar.take() {
-        Some(b) => (b.surface, b.shell, b.node, b.buffer, b.backing, b.old),
+    let existing = state.bars.iter().position(|b| b.mon == mon);
+    if let Some(i) = existing {
+        state.teardown_bar_modules_at(i);
+    }
+    let (surface, shell, node, buffer, backing, old) = match existing {
+        Some(i) => {
+            let b = state.bars.remove(i);
+            (b.surface, b.shell, b.node, b.buffer, b.backing, b.old)
+        }
         None => {
             // Surface must have no role/buffer before get_shell_surface; a buffer
             // is attached later, in the render pass.
@@ -1363,7 +1413,7 @@ fn cmd_bar_create(state: &mut State, opts: &[String]) -> String {
             (surface, shell, node, None, None, None)
         }
     };
-    state.bar = Some(Bar {
+    state.bars.push(Bar {
         surface,
         shell,
         node,
@@ -1382,6 +1432,7 @@ fn cmd_bar_create(state: &mut State, opts: &[String]) -> String {
         hit: Vec::new(),
         origin: (0, 0),
     });
+    state.bar_current = state.bars.len() - 1;
     state.request_manage();
     ok()
 }
