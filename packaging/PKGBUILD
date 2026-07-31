@@ -1,7 +1,7 @@
 # Maintainer: the sommerflusswm authors
 pkgname=sommerflusswm
 pkgver=0.1.0
-pkgrel=29
+pkgrel=30
 pkgdesc="herbstluftwm successor on river: sfwm window manager + sc control client (monitors, keybinds, frame tree, fullscreen/float/mouse/rules/borders/bar/wallpaper)"
 arch=('x86_64')
 url="https://github.com/dkoch84/sommerflusswm"
@@ -47,6 +47,9 @@ package() {
     # Example config: river's init and the sommerflusswm autostart (calls sc).
     install -Dm755 sfwm/examples/autostart  "$pkgdir/usr/share/sommerflusswm/autostart"
     install -Dm755 sfwm/examples/river-init  "$pkgdir/usr/share/sommerflusswm/river-init"
+
+    # Login-screen session entry: "sfwm" (starts river, whose init execs sfwm).
+    install -Dm644 sfwm/examples/sfwm.desktop "$pkgdir/usr/share/wayland-sessions/sfwm.desktop"
 
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"

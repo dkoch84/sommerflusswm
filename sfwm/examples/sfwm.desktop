@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=sfwm
+Comment=sommerflusswm — herbstluftwm successor on river
+Exec=river
+Type=Application
+DesktopNames=river;sfwm
