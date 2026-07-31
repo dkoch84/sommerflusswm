@@ -1,7 +1,7 @@
 # Maintainer: the sommerflusswm authors
 pkgname=sommerflusswm
 pkgver=0.1.0
-pkgrel=33
+pkgrel=34
 pkgdesc="herbstluftwm successor on river: sfwm window manager + sc control client (monitors, keybinds, frame tree, fullscreen/float/mouse/rules/borders/bar/wallpaper)"
 arch=('x86_64')
 url="https://github.com/dkoch84/sommerflusswm"
@@ -53,6 +53,17 @@ package() {
     # user's init if present, else the packaged river-init (which execs sfwm).
     install -Dm644 sfwm/examples/sfwm.desktop "$pkgdir/usr/share/wayland-sessions/sfwm.desktop"
     install -Dm755 sfwm/examples/sfwm-session "$pkgdir/usr/bin/sfwm-session"
+
+    # Bar executor scripts (the panel modules); the autostart uses
+    # ~/scripts/bar when present, else these packaged copies.
+    for f in sfwm/examples/bar/*; do
+        install -Dm755 "$f" "$pkgdir/usr/share/sommerflusswm/bar/$(basename "$f")"
+    done
+
+    # Helper scripts referenced by keybinds/gestures.
+    install -Dm755 sfwm/examples/float-toggle.sh    "$pkgdir/usr/share/sommerflusswm/float-toggle.sh"
+    install -Dm755 sfwm/examples/resize-viewport.sh "$pkgdir/usr/share/sommerflusswm/resize-viewport.sh"
+    install -Dm755 sfwm/examples/window-switcher.sh "$pkgdir/usr/share/sommerflusswm/window-switcher.sh"
 
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"

@@ -1,0 +1,44 @@
+#!/bin/bash
+
+# Weather bar executor — OpenWeatherMap.
+#
+# Credentials/location live in a config file, NOT here (this script ships in
+# the sommerflusswm package). Create it with your key and coordinates:
+#
+#   ~/.config/sommerflusswm/weather.conf:
+#     API_KEY=...
+#     LAT=43.7
+#     LON=-87.7
+#     UNITS=imperial
+
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/sommerflusswm/weather.conf"
+[ -r "$CONF" ] || exit 0
+. "$CONF"
+[ -n "${API_KEY:-}" ] || exit 0
+UNITS="${UNITS:-imperial}"
+
+URL="http://api.openweathermap.org/data/2.5/weather?lat=${LAT}&lon=${LON}&appid=${API_KEY}&units=${UNITS}"
+
+response=$(curl -s "$URL")
+
+if [ $? -ne 0 ]; then
+    echo "Error: Failed to fetch weather data"
+    exit 1
+fi
+
+# Check for API error
+if echo "$response" | jq -e '.cod != 200' > /dev/null 2>&1; then
+    message=$(echo "$response" | jq -r '.message // "Unknown error"')
+    echo "API Error: $message"
+    exit 1
+fi
+
+city=$(echo "$response" | jq -r '.name')
+temperature=$(echo "$response" | jq -r '.main.temp')
+humidity=$(echo "$response" | jq -r '.main.humidity')
+weather=$(echo "$response" | jq -r '.weather[0].description')
+
+# Save condition for bar-weather-icon
+echo "$weather" > /tmp/weather-condition
+
+echo "${city}: ${temperature}° - ${weather}"

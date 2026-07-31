@@ -1,0 +1,13 @@
+#!/bin/bash
+
+if test ! -e /tmp/weather-condition
+then
+	sleep 7
+fi
+
+condition=$(cat /tmp/weather-condition | awk '{print tolower($0)}')
+condition+=';'
+
+cond=$(grep "^$condition" /home/daniel/scripts/files/weather-list | awk -F\; '{print $2}')
+
+echo -e $cond

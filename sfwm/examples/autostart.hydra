@@ -13,6 +13,9 @@
 #   5: float1 over monitor 3, tag 8
 
 Mod=Super
+# sc helper scripts: user copies win, else the packaged ones
+S="$HOME/scripts/sfwm"
+[ -d "$S" ] || S=/usr/share/sommerflusswm
 sc keyunbind --all
 sc mouseunbind --all
 sc gestureunbind --all
@@ -39,7 +42,7 @@ sc keybind $Mod-d spawn dolphin --platformtheme qt6ct
 sc keybind $Mod-Shift-s spawn flameshot gui
 sc keybind $Mod-Shift-f spawn flameshot gui -p "$HOME/shots"
 sc keybind $Mod-m       launcher
-sc keybind Alt-Tab      spawn "$HOME/scripts/sfwm/window-switcher.sh"
+sc keybind Alt-Tab      spawn "$S/window-switcher.sh"
 
 # media / fn keys
 sc keybind XF86AudioLowerVolume spawn "$HOME/scripts/utils/dankvol" -s 2
@@ -95,8 +98,8 @@ sc keybind $Mod-i         jumpto urgent
 sc keybind $Mod-f           fullscreen toggle
 sc keybind $Mod-p           pseudotile toggle
 sc keybind $Mod-Shift-space floating toggle
-sc keybind $Mod-s spawn "$HOME/scripts/sfwm/float-toggle.sh"
-sc keybind $Mod-z spawn "$HOME/scripts/sfwm/resize-viewport.sh"
+sc keybind $Mod-s spawn "$S/float-toggle.sh"
+sc keybind $Mod-z spawn "$S/resize-viewport.sh"
 
 # --- mouse ----------------------------------------------------------------------
 sc mousebind $Mod-Button1       move
@@ -106,8 +109,8 @@ sc mousebind $Mod-Shift-Button1 resize
 # --- touchpad gestures (native libinput; user must be in the `input` group) -----
 sc gesturebind swipe3-left  use_index +1 --skip-visible
 sc gesturebind swipe3-right use_index -1 --skip-visible
-sc gesturebind swipe3-up    spawn "$HOME/scripts/sfwm/float-toggle.sh"
-sc gesturebind swipe3-down  spawn "$HOME/scripts/sfwm/float-toggle.sh"
+sc gesturebind swipe3-up    spawn "$S/float-toggle.sh"
+sc gesturebind swipe3-down  spawn "$S/float-toggle.sh"
 
 # --- theme (herbst values) ------------------------------------------------------
 sc set window_gap 8
@@ -158,6 +161,7 @@ command -v sfwm-appearance >/dev/null && sfwm-appearance --restore &
 
 # --- status bar (native, replaces tint2) — on the main 4K (monitor 1) -----------
 B="$HOME/scripts/bar"
+[ -d "$B" ] || B=/usr/share/sommerflusswm/bar   # packaged copies
 TEXT='Iosevka Term'
 ICON='Font Awesome 7 Free Solid'
 sep() { sc bar add separator size=10 style=empty; }
