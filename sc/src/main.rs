@@ -72,6 +72,9 @@ INPUT BINDINGS
   mousebind <mods+button> <move|resize|zoom> | mouseunbind <--all>
   gesturebind <swipeN-dir> <command...>  e.g. gesturebind swipe3-left use_index +1
   gestureunbind <spec|--all> | list_gesturebinds   (needs user in `input` group)
+  select_region      native region select: drag, or click a window to snap; prints
+                     X,Y WxH (grim -g format); empty + Esc = cancelled
+  list_geometry      visible window rects, one X,Y WxH per line
 
 RULES
   rule [class~re] [app_id=..] [tag=..] [floating=on] [focus=on] [monitor=..] [dock=top] …

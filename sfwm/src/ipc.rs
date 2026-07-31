@@ -55,6 +55,14 @@ pub fn handle_connection(mut stream: UnixStream, state: &mut State) {
         return;
     }
 
+    // `sc select_region`: native region selector (slurp replacement). Hold the
+    // connection open; the reply is "X,Y WxH" (empty on Esc/cancel).
+    if args.first().map(String::as_str) == Some("select_region") {
+        let _ = stream.set_read_timeout(None);
+        state.open_region_select(stream);
+        return;
+    }
+
     let reply = dispatch(state, &args);
     let _ = stream.write_all(reply.as_bytes());
     let _ = stream.flush();

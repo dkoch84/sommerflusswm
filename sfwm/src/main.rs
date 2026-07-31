@@ -578,6 +578,30 @@ impl Rule {
     }
 }
 
+/// Native region-selection overlay (`sc select_region`): dims the focused
+/// monitor; drag a rectangle, or click inside a window to snap to its exact
+/// rect. Replies slurp-style ("X,Y WxH", global coords) on the held stream —
+/// an empty reply means cancelled. Exists because slurp crashes under river.
+struct RegionSelect {
+    surface: WlSurface,
+    shell: RiverShellSurfaceV1,
+    node: RiverNodeV1,
+    buffer: Option<WlBuffer>,
+    backing: Option<std::fs::File>,
+    old: Option<(WlBuffer, std::fs::File)>,
+    /// Monitor rect the overlay covers (global coordinates).
+    mon: Rect,
+    /// Visible window rects on that monitor (global), for click-to-snap.
+    boxes: Vec<Rect>,
+    /// Reply stream held open until selection/cancel.
+    stream: UnixStream,
+    /// Pointer position, surface-local.
+    cur: (i32, i32),
+    /// Drag anchor, surface-local (Some while a button is held).
+    drag: Option<(i32, i32)>,
+    last_sig: Option<u64>,
+}
+
 /// An interactive pointer operation in progress: move/resize a floating window,
 /// or (hlwm-style) resize the frame splits around a tiled window.
 struct PointerOp {
@@ -656,6 +680,10 @@ struct State {
     /// Tags in floating mode (hlwm `floating <tag> on`): every window on such a
     /// tag is laid out floating, regardless of its per-window flag.
     floating_tags: HashSet<u32>,
+    /// Native region-selection overlay, while open (`sc select_region`).
+    region: Option<RegionSelect>,
+    /// Whether the pointer is currently over the region overlay.
+    pointer_over_region: bool,
 
     // --- theming ---
     border_width: i32,
@@ -1471,8 +1499,10 @@ impl State {
             }
         }
 
-        // Keyboard focus: the tray menu (for Escape) then the launcher grab it
-        // while open, otherwise it follows the focused monitor's focused window.
+        // Keyboard focus: modal overlays grab it while open (region selector,
+        // then tray menu, then launcher), otherwise it follows the focused
+        // monitor's focused window.
+        let region_shell = self.region.as_ref().map(|r| r.shell.clone());
         let menu_shell = self.tray_menu.as_ref().map(|m| m.shell.clone());
         let launcher_shell = self.launcher.as_ref().map(|l| l.shell.clone());
         let focus_win = self
@@ -1480,11 +1510,12 @@ impl State {
             .and_then(|wid| self.windows.get(&wid))
             .map(|w| w.win.clone());
         for seat in &self.seats {
-            match (&menu_shell, &launcher_shell, &focus_win) {
-                (Some(shell), _, _) => seat.focus_shell_surface(shell),
-                (None, Some(shell), _) => seat.focus_shell_surface(shell),
-                (None, None, Some(w)) => seat.focus_window(w),
-                (None, None, None) => seat.clear_focus(),
+            match (&region_shell, &menu_shell, &launcher_shell, &focus_win) {
+                (Some(shell), _, _, _) => seat.focus_shell_surface(shell),
+                (None, Some(shell), _, _) => seat.focus_shell_surface(shell),
+                (None, None, Some(shell), _) => seat.focus_shell_surface(shell),
+                (None, None, None, Some(w)) => seat.focus_window(w),
+                (None, None, None, None) => seat.clear_focus(),
             }
         }
     }
@@ -1596,8 +1627,10 @@ impl State {
         self.render_notifications(qh);
         // ...except the launcher overlay, which is the very topmost when open...
         self.render_launcher(qh);
-        // ...and the tray context menu, topmost of all while it's open.
+        // ...and the tray context menu, topmost of all while it's open...
         self.render_menu(qh);
+        // ...and the region selector, above even that.
+        self.render_region(qh);
     }
 
     /// Draw and place the status bar, inside the render sequence. Rebuilds the
@@ -2813,6 +2846,196 @@ impl State {
         self.request_manage();
     }
 
+    /// Open the native region selector; the reply goes to `stream` when the user
+    /// finishes (drag release / click on a window) or cancels (Esc → empty).
+    fn open_region_select(&mut self, stream: UnixStream) {
+        self.close_region_select(); // a new request replaces any open selector
+        let (Some(comp), Some(wm)) = (self.compositor.clone(), self.wm.clone()) else {
+            return;
+        };
+        let Some(mon) = self
+            .monitors
+            .list
+            .get(self.monitors.focus)
+            .or_else(|| self.monitors.list.first())
+            .map(|m| m.rect)
+        else {
+            return;
+        };
+        // Click-to-snap targets: visible windows intersecting this monitor.
+        let boxes: Vec<Rect> = self
+            .compute_layout()
+            .iter()
+            .filter(|i| i.visible)
+            .map(|i| i.rect)
+            .filter(|r| {
+                r.x < mon.x + mon.w && r.x + r.w > mon.x && r.y < mon.y + mon.h && r.y + r.h > mon.y
+            })
+            .collect();
+        let qh = self.qh.clone();
+        let surface = comp.create_surface(&qh, ());
+        let shell = wm.get_shell_surface(&surface, &qh, ());
+        let node = shell.get_node(&qh, ());
+        self.region = Some(RegionSelect {
+            surface,
+            shell,
+            node,
+            buffer: None,
+            backing: None,
+            old: None,
+            mon,
+            boxes,
+            stream,
+            cur: (0, 0),
+            drag: None,
+            last_sig: None,
+        });
+        self.request_manage();
+    }
+
+    /// Cancel the region selector (empty reply → client exits with nothing).
+    fn close_region_select(&mut self) {
+        if let Some(r) = self.region.take() {
+            drop_launcher_surface(r.surface, r.shell, r.node, r.buffer, r.old);
+            self.pointer_over_region = false;
+            self.request_manage();
+        }
+    }
+
+    /// Finish the region selector replying `rect` (global coords, slurp format).
+    fn region_finish(&mut self, rect: Rect) {
+        use std::io::Write;
+        let Some(r) = self.region.take() else { return };
+        let mut stream = r.stream;
+        let _ = writeln!(stream, "{},{} {}x{}", rect.x, rect.y, rect.w.max(1), rect.h.max(1));
+        let _ = stream.flush();
+        drop_launcher_surface(r.surface, r.shell, r.node, r.buffer, r.old);
+        self.pointer_over_region = false;
+        self.request_manage();
+    }
+
+    /// Pointer button press/release over the region overlay.
+    fn region_button(&mut self, pressed: bool) {
+        let Some(r) = self.region.as_mut() else { return };
+        if pressed {
+            r.drag = Some(r.cur);
+            self.request_manage();
+            return;
+        }
+        // Release: a real drag selects the rectangle; a click (< 5px of travel)
+        // snaps to the smallest window rect under the pointer, else the monitor.
+        let Some((ax, ay)) = r.drag.take() else { return };
+        let (cx, cy) = r.cur;
+        let mon = r.mon;
+        if (cx - ax).abs() < 5 && (cy - ay).abs() < 5 {
+            let (gx, gy) = (mon.x + cx, mon.y + cy);
+            let hit = r
+                .boxes
+                .iter()
+                .filter(|b| gx >= b.x && gx < b.x + b.w && gy >= b.y && gy < b.y + b.h)
+                .min_by_key(|b| b.w as i64 * b.h as i64)
+                .copied()
+                .unwrap_or(mon);
+            self.region_finish(hit);
+        } else {
+            let (x0, x1) = (ax.min(cx), ax.max(cx));
+            let (y0, y1) = (ay.min(cy), ay.max(cy));
+            self.region_finish(Rect::new(mon.x + x0, mon.y + y0, x1 - x0, y1 - y0));
+        }
+    }
+
+    /// Draw the region-selection overlay: dim everywhere except the current
+    /// selection (drag rect, or the snap-preview box under the pointer), with a
+    /// border. Redraws on pointer motion; runs inside the render sequence.
+    fn render_region(&mut self, qh: &QueueHandle<Self>) {
+        if self.region.is_none() {
+            return;
+        }
+        let Some(shm) = self.shm.clone() else { return };
+        let (mon, cur, drag) = {
+            let r = self.region.as_ref().unwrap();
+            (r.mon, r.cur, r.drag)
+        };
+        let (w, h) = (mon.w.max(1), mon.h.max(1));
+
+        // The highlighted rect, surface-local: the drag rect, else the snap box.
+        let sel: Option<(i32, i32, i32, i32)> = match drag {
+            Some((ax, ay)) => {
+                let (x0, x1) = (ax.min(cur.0), ax.max(cur.0));
+                let (y0, y1) = (ay.min(cur.1), ay.max(cur.1));
+                Some((x0, y0, (x1 - x0).max(1), (y1 - y0).max(1)))
+            }
+            None => {
+                let (gx, gy) = (mon.x + cur.0, mon.y + cur.1);
+                self.region
+                    .as_ref()
+                    .unwrap()
+                    .boxes
+                    .iter()
+                    .filter(|b| gx >= b.x && gx < b.x + b.w && gy >= b.y && gy < b.y + b.h)
+                    .min_by_key(|b| b.w as i64 * b.h as i64)
+                    .map(|b| (b.x - mon.x, b.y - mon.y, b.w, b.h))
+            }
+        };
+
+        let sig = {
+            use std::hash::{Hash, Hasher};
+            let mut hs = std::collections::hash_map::DefaultHasher::new();
+            (w, h, sel).hash(&mut hs);
+            hs.finish()
+        };
+        if self.region.as_ref().unwrap().last_sig != Some(sig) {
+            let dim = (0x00u8, 0x00u8, 0x00u8, 0x66u8);
+            let border = self.launcher_theme.sel_bg;
+            let mut data = vec![0u8; w as usize * h as usize * 4];
+            match sel {
+                None => fill_rect(&mut data, w, h, 0, 0, w, h, dim),
+                Some((sx, sy, sw, sh)) => {
+                    // Dim the four bands around the selection; selection stays clear.
+                    fill_rect(&mut data, w, h, 0, 0, w, sy, dim);
+                    fill_rect(&mut data, w, h, 0, sy + sh, w, h - sy - sh, dim);
+                    fill_rect(&mut data, w, h, 0, sy, sx, sh, dim);
+                    fill_rect(&mut data, w, h, sx + sw, sy, w - sx - sw, sh, dim);
+                    // 2px border.
+                    let bw = 2;
+                    fill_rect(&mut data, w, h, sx - bw, sy - bw, sw + 2 * bw, bw, border);
+                    fill_rect(&mut data, w, h, sx - bw, sy + sh, sw + 2 * bw, bw, border);
+                    fill_rect(&mut data, w, h, sx - bw, sy, bw, sh, border);
+                    fill_rect(&mut data, w, h, sx + sw, sy, bw, sh, border);
+                }
+            }
+            premultiply(&mut data);
+
+            let r = self.region.as_mut().unwrap();
+            if let Some((b, _)) = r.old.take() {
+                b.destroy();
+            }
+            r.old = match (r.buffer.take(), r.backing.take()) {
+                (Some(b), Some(f)) => Some((b, f)),
+                _ => None,
+            };
+            match shm_file(&data) {
+                Ok(file) => {
+                    let pool = shm.create_pool(file.as_fd(), data.len() as i32, qh, ());
+                    let buffer = pool.create_buffer(0, w, h, w * 4, wl_shm::Format::Argb8888, qh, ());
+                    pool.destroy();
+                    r.shell.sync_next_commit();
+                    r.surface.attach(Some(&buffer), 0, 0);
+                    r.surface.damage_buffer(0, 0, w, h);
+                    r.surface.commit();
+                    r.buffer = Some(buffer);
+                    r.backing = Some(file);
+                    r.last_sig = Some(sig);
+                }
+                Err(e) => eprintln!("sfwm: region: shm buffer failed: {e}"),
+            }
+        }
+
+        let r = self.region.as_mut().unwrap();
+        r.node.set_position(mon.x, mon.y);
+        r.node.place_top();
+    }
+
     /// Draw the fullscreen fuzzy launcher on the focused monitor (translucent, on
     /// top of everything). Rebuilds the buffer only when the query/selection/size
     /// changes. Runs inside the render sequence (from `do_render`).
@@ -3535,6 +3758,8 @@ fn main() {
         gestures: None,
         gesturebinds: HashMap::new(),
         floating_tags: HashSet::new(),
+        region: None,
+        pointer_over_region: false,
         border_width: 0,
         border_active: (0x4e, 0x9b, 0xcf, 0xff),
         border_normal: (0x1d, 0x25, 0x2b, 0xff),
@@ -4077,13 +4302,24 @@ impl Dispatch<WlPointer, ()> for State {
         match event {
             Event::Enter { surface, surface_x, surface_y, .. } => {
                 let sid = surface.id();
-                state.pointer_over_menu = state
-                    .tray_menu
+                state.pointer_over_region = state
+                    .region
                     .as_ref()
-                    .is_some_and(|m| m.surface.id() == sid);
-                state.pointer_over_bar = !state.pointer_over_menu
+                    .is_some_and(|r| r.surface.id() == sid);
+                state.pointer_over_menu = !state.pointer_over_region
+                    && state
+                        .tray_menu
+                        .as_ref()
+                        .is_some_and(|m| m.surface.id() == sid);
+                state.pointer_over_bar = !state.pointer_over_region
+                    && !state.pointer_over_menu
                     && state.bar.as_ref().is_some_and(|b| b.surface.id() == sid);
-                if state.pointer_over_menu {
+                if state.pointer_over_region {
+                    if let Some(r) = state.region.as_mut() {
+                        r.cur = (surface_x as i32, surface_y as i32);
+                    }
+                    state.request_manage();
+                } else if state.pointer_over_menu {
                     state.menu_pointer_moved(surface_x as i32, surface_y as i32);
                 } else if state.pointer_over_bar {
                     state.bar_pointer = (surface_x as i32, surface_y as i32);
@@ -4091,6 +4327,9 @@ impl Dispatch<WlPointer, ()> for State {
             }
             Event::Leave { surface, .. } => {
                 let sid = surface.id();
+                if state.region.as_ref().is_some_and(|r| r.surface.id() == sid) {
+                    state.pointer_over_region = false;
+                }
                 if state.tray_menu.as_ref().is_some_and(|m| m.surface.id() == sid) {
                     state.pointer_over_menu = false;
                 }
@@ -4099,7 +4338,12 @@ impl Dispatch<WlPointer, ()> for State {
                 }
             }
             Event::Motion { surface_x, surface_y, .. } => {
-                if state.pointer_over_menu {
+                if state.pointer_over_region {
+                    if let Some(r) = state.region.as_mut() {
+                        r.cur = (surface_x as i32, surface_y as i32);
+                    }
+                    state.request_manage();
+                } else if state.pointer_over_menu {
                     state.menu_pointer_moved(surface_x as i32, surface_y as i32);
                 } else if state.pointer_over_bar {
                     state.bar_pointer = (surface_x as i32, surface_y as i32);
@@ -4110,13 +4354,22 @@ impl Dispatch<WlPointer, ()> for State {
                 // fallback (below) can route with the right button if wl_pointer
                 // enter/motion isn't being delivered to our shell surface.
                 state.last_pointer_button = button;
-                if state.pointer_over_menu {
+                if state.pointer_over_region {
+                    state.region_button(true);
+                } else if state.pointer_over_menu {
                     let (mx, my) = state.menu_pointer;
                     state.menu_click(mx, my);
                 } else if state.pointer_over_bar {
                     eprintln!("sfwm: bar: wl_pointer button={button} over_bar=true");
                     let lx = state.bar_pointer.0;
                     state.bar_click(lx, button);
+                }
+            }
+            Event::Button {
+                state: WEnum::Value(wl_pointer::ButtonState::Released), ..
+            } => {
+                if state.pointer_over_region {
+                    state.region_button(false);
                 }
             }
             Event::Axis { axis: WEnum::Value(axis), value, .. } => {
@@ -4184,13 +4437,17 @@ impl Dispatch<WlKeyboard, ()> for State {
                 state: WEnum::Value(wl_keyboard::KeyState::Pressed),
                 ..
             } => {
-                if state.tray_menu.is_some() || state.launcher.is_some() {
+                if state.region.is_some() || state.tray_menu.is_some() || state.launcher.is_some() {
                     if let Some((sym, utf8)) = state.xkb_state.as_ref().map(|xs| {
                         let kc: xkbcommon::xkb::Keycode = (key + 8).into();
                         (xs.key_get_one_sym(kc).raw(), xs.key_get_utf8(kc))
                     }) {
-                        // The menu (modal, on top) consumes keys before the launcher.
-                        if state.tray_menu.is_some() {
+                        // Topmost modal consumes keys: region → menu → launcher.
+                        if state.region.is_some() {
+                            if sym == xkbcommon::xkb::keysyms::KEY_Escape {
+                                state.close_region_select();
+                            }
+                        } else if state.tray_menu.is_some() {
                             state.menu_key(sym);
                         } else {
                             state.launcher_key(sym, utf8);

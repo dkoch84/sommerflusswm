@@ -36,25 +36,30 @@ to_box() {
 geo=""
 case "$mode" in
     gui)
-        # Feed sfwm's visible window rects so a click snaps to a window.
-        # slurp segfaults under river on some setups (cursor-theme path); treat
-        # a crash (rc >= 128, killed by signal) as "no slurp" and fall back to
-        # a flameshot-style frozen fullscreen in satty, cropping there instead.
-        if command -v slurp >/dev/null; then
-            geo=$(sc list_geometry | slurp)
-            rc=$?
-            if [ $rc -eq 0 ]; then
-                :
-            elif [ $rc -lt 128 ]; then
-                exit 0   # Esc = cancel
-            else
-                geo=""   # crashed → fullscreen crop fallback
+        # 1st choice: sfwm's NATIVE region selector — drag a rect, or click a
+        # window to snap to its exact rect. Empty reply = Esc/cancel.
+        if geo=$(sc select_region 2>/dev/null); then
+            [[ -z "$geo" ]] && exit 0
+        else
+            # Older sfwm without select_region: try slurp with window boxes.
+            # slurp segfaults under river on some setups; treat death-by-signal
+            # (rc >= 128) as "no slurp".
+            geo=""
+            if command -v slurp >/dev/null; then
+                geo=$(sc list_geometry | slurp)
+                rc=$?
+                if [ $rc -ne 0 ] && [ $rc -lt 128 ]; then
+                    exit 0   # Esc = cancel
+                elif [ $rc -ge 128 ]; then
+                    geo=""
+                fi
             fi
-        fi
-        if [[ -z "$geo" ]]; then
-            grim - | satty --filename - --fullscreen --early-exit \
-                --init-tool crop --copy-command wl-copy --output-filename "$out"
-            exit $?
+            # Last resort: flameshot-style frozen fullscreen, crop in satty.
+            if [[ -z "$geo" ]]; then
+                grim - | satty --filename - --fullscreen --early-exit \
+                    --init-tool crop --copy-command wl-copy --output-filename "$out"
+                exit $?
+            fi
         fi
         ;;
     window)
