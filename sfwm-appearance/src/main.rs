@@ -679,17 +679,25 @@ impl App {
                 // a stray/stuck pointer-drag would otherwise turn into a slide).
                 .drag_to_scroll(false)
                 .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        let mut clicked: Option<PathBuf> = None;
-                        for path in &paths {
-                            if self.thumb_widget(ui, path) {
-                                clicked = Some(path.clone());
+                    // horizontal_wrapped can't wrap Frame containers (their size
+                    // isn't known until after layout), so chunk into explicit
+                    // rows: cell = min size + frame inner margin, plus spacing.
+                    let cell_w = thumbs::THUMB_MAX as f32 + 12.0 + 8.0
+                        + ui.spacing().item_spacing.x;
+                    let cols = (ui.available_width() / cell_w).floor().max(1.0) as usize;
+                    let mut clicked: Option<PathBuf> = None;
+                    for row in paths.chunks(cols) {
+                        ui.horizontal(|ui| {
+                            for path in row {
+                                if self.thumb_widget(ui, path) {
+                                    clicked = Some(path.clone());
+                                }
                             }
-                        }
-                        if let Some(p) = clicked {
-                            self.selected_image = Some(p);
-                        }
-                    });
+                        });
+                    }
+                    if let Some(p) = clicked {
+                        self.selected_image = Some(p);
+                    }
                 });
         });
     }
