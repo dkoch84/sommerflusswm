@@ -60,7 +60,7 @@ build_one() {
     rel=$(grep '^pkgrel=' PKGBUILD | cut -d= -f2)
     echo "==> $name $ver-$rel"
 
-    make_tarball "$dir"
+    make_tarball "$dir" "$ver"
     cd "$dir"
     rm -rf src pkg
     rm -f ./*.pkg.tar*
