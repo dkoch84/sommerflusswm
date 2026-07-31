@@ -173,6 +173,23 @@ pub(crate) fn dispatch(state: &mut State, args: &[String]) -> String {
             ok()
         }
         "version" => format!("sommerflusswm {}\n", env!("CARGO_PKG_VERSION")),
+        // hlwm setenv/getenv: env of the WM process, inherited by everything
+        // `spawn`ed (exports in the autostart script do NOT reach spawns).
+        "setenv" => {
+            if rest.len() < 2 {
+                err("setenv: expected <name> <value>")
+            } else {
+                std::env::set_var(&rest[0], &rest[1]);
+                ok()
+            }
+        }
+        "getenv" => match rest.first() {
+            Some(n) => match std::env::var(n) {
+                Ok(v) => format!("{v}\n"),
+                Err(_) => err(&format!("getenv: {n} is not set")),
+            },
+            None => err("getenv: expected a variable name"),
+        },
         // --- object/attribute tree ---
         "attr" => crate::attr::list(state, rest.first().map(|s| s.as_str())),
         "get_attr" => match rest.first() {
@@ -854,6 +871,25 @@ fn cmd_window_mode(state: &mut State, rest: &[String], mode: WinMode) -> String 
 }
 
 fn cmd_floating(state: &mut State, rest: &[String]) -> String {
+    // hlwm tag form: `floating <tag> [on|off|toggle|status]` — every window on
+    // a floating tag is laid out floating (the scratchpad-tag setup). The bare
+    // form keeps sfwm's per-window meaning (bound to Mod-Shift-space).
+    if let Some(tag) = rest.first().and_then(|s| s.parse::<u32>().ok()) {
+        let cur = state.floating_tags.contains(&tag);
+        let want = match rest.get(1).map(|s| s.as_str()).unwrap_or("toggle") {
+            "status" => return format!("{}\n", if cur { "on" } else { "off" }),
+            "on" | "true" => true,
+            "off" | "false" => false,
+            _ => !cur,
+        };
+        if want {
+            state.floating_tags.insert(tag);
+        } else {
+            state.floating_tags.remove(&tag);
+        }
+        state.request_manage();
+        return ok();
+    }
     let Some(wid) = state.focused_window() else {
         return err("floating: no focused window");
     };
@@ -1199,6 +1235,7 @@ fn cmd_bar_create(state: &mut State, opts: &[String]) -> String {
     }
 
     let mut anchor = DockAnchor::Top;
+    let mut mon = 0usize;
     let mut height = 26i32;
     let mut bg = (0xf7u8, 0xf8u8, 0xf3u8, 0xffu8);
     let mut fg = (0x1du8, 0x25u8, 0x2bu8, 0xffu8);
@@ -1212,6 +1249,11 @@ fn cmd_bar_create(state: &mut State, opts: &[String]) -> String {
             _ if tok.starts_with("height=") => {
                 if let Ok(h) = tok["height=".len()..].parse::<i32>() {
                     height = h.max(1);
+                }
+            }
+            _ if tok.starts_with("mon=") => {
+                if let Ok(m) = tok["mon=".len()..].parse::<usize>() {
+                    mon = m;
                 }
             }
             // Float the bar: `margin=N` insets both axes; `marginx=`/`marginy=`
@@ -1274,6 +1316,7 @@ fn cmd_bar_create(state: &mut State, opts: &[String]) -> String {
         surface,
         shell,
         node,
+        mon,
         anchor,
         height,
         margin_x,

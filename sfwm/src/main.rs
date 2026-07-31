@@ -136,6 +136,8 @@ struct Bar {
     surface: WlSurface,
     shell: RiverShellSurfaceV1,
     node: RiverNodeV1,
+    /// Monitor index the bar lives on (`bar create mon=N`; falls back to 0).
+    mon: usize,
     /// Edge the bar is pinned to (full-width on its monitor, minus margins).
     anchor: DockAnchor,
     height: i32,
@@ -645,6 +647,9 @@ struct State {
     gestures: Option<gestures::Gestures>,
     /// Gesture bindings: normalized spec ("swipe3-left") → command argv.
     gesturebinds: HashMap<String, Vec<String>>,
+    /// Tags in floating mode (hlwm `floating <tag> on`): every window on such a
+    /// tag is laid out floating, regardless of its per-window flag.
+    floating_tags: HashSet<u32>,
 
     // --- theming ---
     border_width: i32,
@@ -916,7 +921,7 @@ impl State {
                     if self
                         .windows
                         .get(&p.win)
-                        .map_or(false, |w| w.floating || w.dock.is_some())
+                        .map_or(false, |w| self.win_floats(w) || w.dock.is_some())
                     {
                         continue;
                     }
@@ -937,7 +942,7 @@ impl State {
 
             // Floating windows on this tag (not in the tree).
             for (wid, w) in &self.windows {
-                if w.tag != tag || !w.floating || !claimed.insert(*wid) {
+                if w.tag != tag || !self.win_floats(w) || !claimed.insert(*wid) {
                     continue;
                 }
                 items.push(RenderItem {
@@ -1039,7 +1044,7 @@ impl State {
             w.urgent = false; // focusing a window clears its urgency
         }
         // hlwm raise_on_focus: lift a focused floating window above the others.
-        if self.raise_on_focus && self.windows.get(&wid).map_or(false, |w| w.floating) {
+        if self.raise_on_focus && self.windows.get(&wid).map_or(false, |w| self.win_floats(w)) {
             let seq = self.next_raise;
             self.next_raise += 1;
             if let Some(w) = self.windows.get_mut(&wid) {
@@ -1153,6 +1158,12 @@ impl State {
             self.focus_window_by_id(wid);
         }
         self.request_manage();
+    }
+
+    /// Whether a window is laid out floating: its own flag, or its whole tag is
+    /// in floating mode (hlwm `floating <tag> on`).
+    fn win_floats(&self, w: &Window) -> bool {
+        w.floating || self.floating_tags.contains(&w.tag)
     }
 
     /// A reasonable default floating rect: centred half-size on the focused monitor.
@@ -1295,6 +1306,30 @@ impl State {
             }
         }
 
+        // Windows that float only because their tag is floating may never have
+        // been given a float rect (float_geo defaults to 0x0) — seed one from
+        // where they were last placed, or the default centred rect.
+        let needs_geo: Vec<WinId> = self
+            .windows
+            .iter()
+            .filter(|(_, w)| {
+                self.floating_tags.contains(&w.tag)
+                    && (w.float_geo.w <= 0 || w.float_geo.h <= 0)
+            })
+            .map(|(wid, _)| *wid)
+            .collect();
+        for wid in needs_geo {
+            let geo = self
+                .last_rects
+                .get(&wid)
+                .copied()
+                .filter(|r| r.w > 0 && r.h > 0)
+                .unwrap_or_else(|| self.default_float_geo());
+            if let Some(w) = self.windows.get_mut(&wid) {
+                w.float_geo = geo;
+            }
+        }
+
         // Enabling bindings is window-management state — do it inside the sequence.
         for b in self.pending_enable.drain(..) {
             b.enable();
@@ -1360,6 +1395,7 @@ impl State {
                 continue;
             }
             let usable = mon_usable[&mi];
+            let floats = self.windows.get(&wid).map_or(false, |w| self.win_floats(w));
             if let Some(w) = self.windows.get_mut(&wid) {
                 if w.applied_fullscreen {
                     w.win.exit_fullscreen();
@@ -1370,7 +1406,7 @@ impl State {
                     w.win.set_tiled(river_window_v1::Edges::empty());
                 } else {
                     w.win.propose_dimensions(rect.w, rect.h);
-                    let edges = if w.floating || w.dock.is_some() {
+                    let edges = if floats || w.dock.is_some() {
                         river_window_v1::Edges::empty()
                     } else {
                         tiled_edges(rect, usable)
@@ -1448,7 +1484,7 @@ impl State {
             }
             // Position: pseudotile centres the window's natural size in its tile.
             let pos = match self.windows.get(&item.win) {
-                Some(w) if w.pseudotile && !w.floating => {
+                Some(w) if w.pseudotile && !self.win_floats(w) => {
                     let (dw, dh) = w.dims;
                     let dw = if dw > 0 { dw } else { item.rect.w };
                     let dh = if dh > 0 { dh } else { item.rect.h };
@@ -1528,7 +1564,16 @@ impl State {
     /// `top_node` is the topmost window node, so the bar sits above all windows.
     fn render_bar(&mut self, qh: &QueueHandle<Self>, top_node: Option<&RiverNodeV1>) {
         let Some(shm) = self.shm.clone() else { return };
-        let Some(rect) = self.monitors.list.first().map(|m| m.rect) else { return };
+        let bar_mon = self.bar.as_ref().map_or(0, |b| b.mon);
+        let Some(rect) = self
+            .monitors
+            .list
+            .get(bar_mon)
+            .or_else(|| self.monitors.list.first())
+            .map(|m| m.rect)
+        else {
+            return;
+        };
         if self.bar.is_none() {
             return;
         }
@@ -3430,6 +3475,7 @@ fn main() {
         pending_enable: Vec::new(),
         gestures: None,
         gesturebinds: HashMap::new(),
+        floating_tags: HashSet::new(),
         border_width: 0,
         border_active: (0x4e, 0x9b, 0xcf, 0xff),
         border_normal: (0x1d, 0x25, 0x2b, 0xff),

@@ -153,6 +153,7 @@ fn tag_get(state: &State, tag: u32, attr: &str) -> Result<String, String> {
             .count()
             .to_string(),
         "visible" => boolstr(state.monitors.tag_visible(tag)),
+        "floating" => boolstr(state.floating_tags.contains(&tag)),
         _ => return Err(format!("tags.{tag}: no such attribute: {attr}")),
     })
 }

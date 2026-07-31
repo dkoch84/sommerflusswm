@@ -1,0 +1,214 @@
+#!/bin/sh
+# sommerflusswm autostart for hydra — 4 physical displays, 6 virtual monitors.
+# Port of ~/work/projects/sommerflusswm/herbst/autostart. Install at
+# ~/.config/sommerflusswm/autostart (sfwm runs it on startup and `sc reload`).
+#
+# Physical arrangement (same as the herbst set_monitors line):
+#   0: 1440x2560+0+1876     left portrait
+#   1: 4096x2160+1440+2160  main 4K (center bottom)
+#   2: 1440x2560+5536+2160  right portrait
+#   3: 3840x2160+1440+0     top 4K
+# Overlay monitors (raised, tag-locked, floating scratchpads over the 4Ks):
+#   4: float2 over monitor 1, tag 9
+#   5: float1 over monitor 3, tag 8
+
+Mod=Super
+sc keyunbind --all
+sc mouseunbind --all
+sc gestureunbind --all
+sc unrule
+
+# --- environment for spawned programs (hlwm setenv; shell exports don't reach
+# --- `sc spawn`, which forks from the WM process) -------------------------------
+sc setenv CHROME_EXECUTABLE /usr/bin/google-chrome-stable
+sc setenv QT_QPA_PLATFORMTHEME qt6ct
+sc setenv QT_ENABLE_HIGHDPI_SCALING 0
+sc setenv STEAM_FORCE_DESKTOPUI_SCALING 1.0
+
+# --- programs (same keys as herbst) ---------------------------------------------
+sc keybind $Mod-Return spawn alacritty
+sc keybind $Mod-apostrophe spawn "$HOME/work/projects/rat/rat"
+sc keybind $Mod-c spawn code
+sc keybind $Mod-q spawn qutebrowser
+sc keybind $Mod-w spawn qutebrowser.wrapper "https://youtube.com"
+sc keybind $Mod-v spawn "$HOME/scripts/utils/chrome-debug"
+sc keybind $Mod-b spawn microsoft-edge-stable
+sc keybind $Mod-e spawn qutebrowser.matrix "https://app.element.io/#/room/!UDQUAzsPpbcPRJevFT:matrix.org"
+sc keybind $Mod-t spawn "$HOME/scripts/utils/chromer" evergy
+sc keybind $Mod-d spawn dolphin --platformtheme qt6ct
+sc keybind $Mod-Shift-s spawn flameshot gui
+sc keybind $Mod-Shift-f spawn flameshot gui -p "$HOME/shots"
+sc keybind $Mod-m       launcher
+sc keybind Alt-Tab      spawn "$HOME/scripts/sfwm/window-switcher.sh"
+
+# media / fn keys
+sc keybind XF86AudioLowerVolume spawn "$HOME/scripts/utils/dankvol" -s 2
+sc keybind XF86AudioRaiseVolume spawn "$HOME/scripts/utils/dankvol" -d 2
+sc keybind XF86MonBrightnessDown spawn /usr/bin/light -U 5
+sc keybind XF86MonBrightnessUp   spawn /usr/bin/light -A 5
+
+# session
+sc keybind $Mod-Shift-q quit
+sc keybind $Mod-Shift-r reload
+sc keybind $Mod-Shift-c close
+
+# --- tags -----------------------------------------------------------------------
+for i in 1 2 3 4 5 6 7 8 9; do
+  sc keybind "$Mod-$i"       use  "$i"
+  sc keybind "$Mod-Shift-$i" move "$i"
+done
+sc keybind $Mod-period use_index +1 --skip-visible
+sc keybind $Mod-comma  use_index -1 --skip-visible
+sc keybind $Mod-BackSpace cycle_monitor
+
+# --- focus / move within the frame tree -----------------------------------------
+for p in "Left left" "Down down" "Up up" "Right right" "h left" "j down" "k up" "l right"; do
+  set -- $p
+  sc keybind "$Mod-$1"       focus "$2"
+  sc keybind "$Mod-Shift-$1" shift "$2"
+done
+
+# --- splits / resize / layouts / removal ----------------------------------------
+sc keybind $Mod-u split top  0.5
+sc keybind $Mod-o split left 0.5
+sc keybind $Mod-Control-space split explode
+sc keybind $Mod-Control-h resize left  0.005
+sc keybind $Mod-Control-j resize down  0.005
+sc keybind $Mod-Control-k resize up    0.005
+sc keybind $Mod-Control-l resize right 0.005
+sc keybind $Mod-Control-Left  resize left  0.005
+sc keybind $Mod-Control-Down  resize down  0.005
+sc keybind $Mod-Control-Up    resize up    0.005
+sc keybind $Mod-Control-Right resize right 0.005
+sc keybind $Mod-Control-0 set_layout vertical
+sc keybind $Mod-Control-1 set_layout horizontal
+sc keybind $Mod-Control-2 set_layout max
+sc keybind $Mod-Control-3 set_layout grid
+sc keybind $Mod-space     cycle_layout
+sc keybind $Mod-r         remove
+sc keybind $Mod-g         cycle
+sc keybind $Mod-Tab       cycle_all +1
+sc keybind $Mod-Shift-Tab cycle_all -1
+sc keybind $Mod-i         jumpto urgent
+
+# --- per-window modes / scripts -------------------------------------------------
+sc keybind $Mod-f           fullscreen toggle
+sc keybind $Mod-p           pseudotile toggle
+sc keybind $Mod-Shift-space floating toggle
+sc keybind $Mod-s spawn "$HOME/scripts/sfwm/float-toggle.sh"
+sc keybind $Mod-z spawn "$HOME/scripts/sfwm/resize-viewport.sh"
+
+# --- mouse ----------------------------------------------------------------------
+sc mousebind $Mod-Button1       move
+sc mousebind $Mod-Button2       zoom
+sc mousebind $Mod-Shift-Button1 resize
+
+# --- touchpad gestures (native libinput; user must be in the `input` group) -----
+sc gesturebind swipe3-left  use_index +1 --skip-visible
+sc gesturebind swipe3-right use_index -1 --skip-visible
+sc gesturebind swipe3-up    spawn "$HOME/scripts/sfwm/float-toggle.sh"
+sc gesturebind swipe3-down  spawn "$HOME/scripts/sfwm/float-toggle.sh"
+
+# --- theme (herbst values) ------------------------------------------------------
+sc set window_gap 8
+sc set border_width 1
+sc set border_color_active '#4e9bcf'
+sc set border_color_normal '#1d252b'
+# in-WM replacement for the old picom dim-inactive effect; 0 disables
+# sc set inactive_dim 0.15
+
+# --- rules ----------------------------------------------------------------------
+sc rule focus=on
+# (herbst's _NET_WM_WINDOW_TYPE rules don't translate: no window types on
+#  Wayland. Dialogs float via xdg-shell hints; notification daemons are
+#  replaced by the built-in service.)
+
+# --- monitors: 4 physical + 2 raised overlay scratchpads ------------------------
+sc set_monitors 1440x2560+0+1876 4096x2160+1440+2160 1440x2560+5536+2160 3840x2160+1440+0
+
+sc add_monitor 4096x2160+1440+2160 9 float2
+sc raise_monitor float2
+sc lock_tag 9 float2
+sc floating 9 on
+sc set_tag_monitor 9 float2
+
+sc add_monitor 3840x2160+1440+0 8 float1
+sc raise_monitor float1
+sc lock_tag 8 float1
+sc floating 8 on
+sc set_tag_monitor 8 float1
+
+# padding (herbst pads: 36 top for the panel strip, 4 elsewhere). The native
+# bar sits on monitor 1; trim the other monitors' top pad if you don't want
+# the empty strip herbst always reserved.
+sc pad 0 36 4 4 4
+sc pad 1 36 4 4 4
+sc pad 2 36 4 4 4
+sc pad 3 36 4 4 4
+sc pad float2 36 4 4 4
+sc pad float1 36 4 4 4
+
+# --- notifications (built-in, replaces dunst) -----------------------------------
+sc set notify_bg '#f7f8f3'
+sc set notify_fg '#1d252b'
+
+# --- wallpaper (built-in, replaces nitrogen) ------------------------------------
+sc wallpaper color '#1d252b'
+command -v sfwm-appearance >/dev/null && sfwm-appearance --restore &
+
+# --- status bar (native, replaces tint2) — on the main 4K (monitor 1) -----------
+B="$HOME/scripts/bar"
+TEXT='Iosevka Term'
+ICON='Font Awesome 7 Free Solid'
+sep() { sc bar add separator size=10 style=empty; }
+
+sc bar create top mon=1 height=28 marginx=8 marginy=8 bg='#f7f8f3' fg='#1d252b' font=13
+
+sc bar add executor \
+  "f(){ sc tag_status | tr '\t' '\n' | sed -n 's/^#//p'; }; f; sc --idle | while read -r _; do f; done" \
+  continuous family="$TEXT" bg='#db7681' fg='#f8f7f3' pad=12
+sc bar add executor \
+  "f(){ sc tag_status | tr '\t' '\n' | sed -E 's/[0-9]+//' | grep . | paste -sd' '; }; f; sc --idle | while read -r _; do f; done" \
+  continuous family="$TEXT" pad=8
+
+sc bar add spacer
+
+sc bar add tray size=0 spacing=6
+sep
+sc bar add executor "$B/bar-weather"      interval=300 family="$TEXT"
+sc bar add executor "$B/bar-weather-icon" interval=300 family='Weather Icons'
+sep
+sc bar add executor "$B/bar-vim"          interval=1   family="$TEXT"
+sc bar add executor "$B/bar-vim-icon"                  family="$ICON"
+sep
+sc bar add executor "$B/bar-artist"       interval=2   family="$TEXT"
+sc bar add executor "$B/bar-artist-icon"               family="$ICON"
+sep
+sc bar add executor "$B/bar-music"        interval=2   family="$TEXT"
+sc bar add executor "$B/bar-music-icon"                family="$ICON"
+sep
+sc bar add executor "python $B/bar-cpu"   interval=3   family="$TEXT"
+sc bar add executor "$B/bar-cpu-icon"                  family="$ICON"
+sep
+sc bar add executor "$B/bar-date"         interval=500 family="$TEXT"
+sc bar add executor "$B/bar-date-icon"                 family="$ICON"
+sep
+sc bar add executor "$B/bar-clock"        interval=60  family="$TEXT"
+sc bar add executor "$B/bar-clock-icon"                family="$ICON"
+
+# --- RGB ------------------------------------------------------------------------
+liquidctl --match aura set sync color static 5930fc &
+
+# --- start programs once (herbst's my_not_first_autostart guard, now native) ----
+if sc new_attr bool my_not_first_autostart 2>/dev/null; then
+    xfce4-power-manager &
+    kdeconnect-indicator &
+    mpdas -c "$HOME/.config/mpdasrc" &
+    /usr/lib/polkit-kde-authentication-agent-1 &
+    streamcontroller -b &
+    liquidctl initialize all &
+    # redshift-gtk &   # X11 gamma control doesn't work under Wayland; use
+    #                  # wlsunset/gammastep once river gamma support is sorted
+    # xmodmap ~/.Xmodmap  # X11-only; remap via river's xkb options instead
+    # ~/scripts/herbst/loadstate.sh ~/.mystate &  # herbstclient-based; port TBD
+fi
