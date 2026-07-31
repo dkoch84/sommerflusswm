@@ -249,6 +249,17 @@ pub(crate) fn dispatch(state: &mut State, args: &[String]) -> String {
         "load" => cmd_load(state, rest),
         "dump_tree" => cmd_dump_tree(state),
         "quit" => {
+            // Exit the whole Wayland session, not just the WM — river would
+            // otherwise linger as a black screen with a cursor. exit_session
+            // needs river protocol v4+; flush so the request reaches river
+            // before we die.
+            use wayland_client::Proxy as _;
+            if let Some(wm) = state.wm.as_ref().filter(|wm| wm.version() >= 4) {
+                wm.exit_session();
+                if let Some(backend) = wm.backend().upgrade() {
+                    let _ = backend.flush();
+                }
+            }
             std::process::exit(0);
         }
         "reload" => {
