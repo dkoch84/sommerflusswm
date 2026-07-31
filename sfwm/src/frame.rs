@@ -559,19 +559,21 @@ impl Frame {
         // Walk from the focused leaf up to the root looking for a matching split.
         for cut in (0..path.len()).rev() {
             let ancestor_path = &path[..cut];
-            let child_idx = path[cut];
             let node = self.node_at_mut(ancestor_path);
             if let Frame::Split(s) = node {
                 let matches = matches!(s.orient, Orientation::Horizontal) == want_h;
                 if matches {
-                    // Growing "toward" the focused child: if focus is the first
-                    // child, Right/Down grows it; if second, they shrink it.
+                    // The direction names where the SEPARATOR moves, regardless
+                    // of which child holds focus (hlwm semantics): ratio is the
+                    // first child's share, so Right/Down grow it (separator
+                    // moves right/down) and Left/Up shrink it. Flipping the
+                    // sign per focused child made mouse/keyboard resize feel
+                    // inverted from the second child.
                     let sign = match dir {
                         Dir::Right | Dir::Down => 1.0,
                         Dir::Left | Dir::Up => -1.0,
                     };
-                    let adj = if child_idx == 0 { sign } else { -sign };
-                    s.ratio = (s.ratio + adj * delta).clamp(0.05, 0.95);
+                    s.ratio = (s.ratio + sign * delta).clamp(0.05, 0.95);
                     return true;
                 }
             }
