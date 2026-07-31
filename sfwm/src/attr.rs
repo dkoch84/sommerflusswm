@@ -174,6 +174,16 @@ fn client_get(state: &State, wid: WinId, attr: &str) -> Result<String, String> {
             let g = w.float_geo;
             format!("{}x{}{:+}{:+}", g.w, g.h, g.x, g.y)
         }
+        // The window's current on-screen rect (tiled or floating), from the last
+        // render. Used by screenshot.sh for window captures.
+        "geometry" => {
+            let g = state
+                .last_rects
+                .get(&wid)
+                .copied()
+                .ok_or_else(|| format!("clients.{wid}: not currently placed"))?;
+            format!("{}x{}{:+}{:+}", g.w, g.h, g.x, g.y)
+        }
         _ => return Err(format!("clients.{wid}: no such attribute: {attr}")),
     })
 }

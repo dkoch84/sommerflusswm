@@ -1,7 +1,7 @@
 # Maintainer: the sommerflusswm authors
 pkgname=sommerflusswm
 pkgver=0.1.0
-pkgrel=34
+pkgrel=40
 pkgdesc="herbstluftwm successor on river: sfwm window manager + sc control client (monitors, keybinds, frame tree, fullscreen/float/mouse/rules/borders/bar/wallpaper)"
 arch=('x86_64')
 url="https://github.com/dkoch84/sommerflusswm"
@@ -10,7 +10,11 @@ license=('GPL3')
 # wayland provides libwayland-client.so (dlopened); libxkbcommon resolves key names.
 # libinput backs the native touchpad gestures (read directly; user in `input` group).
 depends=('river' 'wayland' 'libxkbcommon' 'libinput')
-optdepends=('sommerflusswm-appearance: GUI wallpaper browser + icon-theme picker')
+optdepends=('sommerflusswm-appearance: GUI wallpaper browser + icon-theme picker'
+            'grim: screenshots (screenshot.sh)'
+            'slurp: screenshot region selection with window snapping'
+            'satty: screenshot annotation UI'
+            'wl-clipboard: copy screenshots to the clipboard')
 makedepends=('rust' 'cargo')
 options=('!debug')
 source=("$pkgname-$pkgver.tar.gz")
@@ -64,6 +68,7 @@ package() {
     install -Dm755 sfwm/examples/float-toggle.sh    "$pkgdir/usr/share/sommerflusswm/float-toggle.sh"
     install -Dm755 sfwm/examples/resize-viewport.sh "$pkgdir/usr/share/sommerflusswm/resize-viewport.sh"
     install -Dm755 sfwm/examples/window-switcher.sh "$pkgdir/usr/share/sommerflusswm/window-switcher.sh"
+    install -Dm755 sfwm/examples/screenshot.sh      "$pkgdir/usr/share/sommerflusswm/screenshot.sh"
 
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"

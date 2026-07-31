@@ -165,6 +165,15 @@ pub(crate) fn dispatch(state: &mut State, args: &[String]) -> String {
         "list_clients" => list_clients(state),
         "list_outputs" => list_outputs(state),
         "list_keybinds" => list_keybinds(state),
+        // Visible window rects in slurp's box format ("X,Y WxH" per line) so
+        // `sc list_geometry | slurp` snaps region selection to windows.
+        "list_geometry" => {
+            let mut out = String::new();
+            for i in state.compute_layout().iter().filter(|i| i.visible) {
+                out.push_str(&format!("{},{} {}x{}\n", i.rect.x, i.rect.y, i.rect.w, i.rect.h));
+            }
+            out
+        }
         "list_rules" => list_rules(state),
         "tag_status" => tag_status(state, rest),
         "emit_hook" => {

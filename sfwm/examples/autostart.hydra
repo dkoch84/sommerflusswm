@@ -39,8 +39,9 @@ sc keybind $Mod-b spawn microsoft-edge-stable
 sc keybind $Mod-e spawn qutebrowser.matrix "https://app.element.io/#/room/!UDQUAzsPpbcPRJevFT:matrix.org"
 sc keybind $Mod-t spawn "$HOME/scripts/utils/chromer" evergy
 sc keybind $Mod-d spawn dolphin --platformtheme qt6ct
-sc keybind $Mod-Shift-s spawn flameshot gui
-sc keybind $Mod-Shift-f spawn flameshot gui -p "$HOME/shots"
+# screenshots: grim+slurp+satty, window-snapping region select (see screenshot.sh)
+sc keybind $Mod-Shift-s spawn "$S/screenshot.sh" gui
+sc keybind $Mod-Shift-f spawn "$S/screenshot.sh" gui "$HOME/shots"
 sc keybind $Mod-m       launcher
 sc keybind Alt-Tab      spawn "$S/window-switcher.sh"
 
