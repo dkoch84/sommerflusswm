@@ -781,30 +781,37 @@ fn command_loop(conn: Connection, registry: Registry, events: Sender<TrayEvent>,
         };
         let conn = conn.clone();
         let events = events.clone();
-        let _ = zbus::block_on(async move {
-            match cmd {
-                TrayCmd::Activate { x, y, .. } => {
-                    let item = Proxy::new(&conn, bus, path, SNI_IFACE).await?;
-                    item.call::<_, _, ()>("Activate", &(x, y)).await
+        // Each command runs on its own thread and fire-and-forgets where no
+        // reply is needed. The loop itself must NEVER block: a single app that
+        // doesn't answer (flameshot ignores Activate replies, dying connections
+        // never answer at all) would otherwise jam every later click behind a
+        // D-Bus timeout — observed as "tray stops responding, then a huge delay".
+        let _ = std::thread::Builder::new().name("sfwm-tray-cmd".into()).spawn(move || {
+            let _ = zbus::block_on(async move {
+                match cmd {
+                    TrayCmd::Activate { x, y, .. } => {
+                        let item = Proxy::new(&conn, bus, path, SNI_IFACE).await?;
+                        item.call_noreply("Activate", &(x, y)).await
+                    }
+                    TrayCmd::SecondaryActivate { x, y, .. } => {
+                        let item = Proxy::new(&conn, bus, path, SNI_IFACE).await?;
+                        item.call_noreply("SecondaryActivate", &(x, y)).await
+                    }
+                    TrayCmd::Scroll { delta, horizontal, .. } => {
+                        let item = Proxy::new(&conn, bus, path, SNI_IFACE).await?;
+                        let orientation = if horizontal { "horizontal" } else { "vertical" };
+                        item.call_noreply("Scroll", &(delta, orientation)).await
+                    }
+                    TrayCmd::OpenMenu { x, y, .. } => {
+                        open_menu(&conn, &events, &bus, &path, &key, x, y).await;
+                        Ok(())
+                    }
+                    TrayCmd::MenuClicked { id, .. } => {
+                        menu_clicked(&conn, &bus, &path, id).await;
+                        Ok(())
+                    }
                 }
-                TrayCmd::SecondaryActivate { x, y, .. } => {
-                    let item = Proxy::new(&conn, bus, path, SNI_IFACE).await?;
-                    item.call::<_, _, ()>("SecondaryActivate", &(x, y)).await
-                }
-                TrayCmd::Scroll { delta, horizontal, .. } => {
-                    let item = Proxy::new(&conn, bus, path, SNI_IFACE).await?;
-                    let orientation = if horizontal { "horizontal" } else { "vertical" };
-                    item.call::<_, _, ()>("Scroll", &(delta, orientation)).await
-                }
-                TrayCmd::OpenMenu { x, y, .. } => {
-                    open_menu(&conn, &events, &bus, &path, &key, x, y).await;
-                    Ok(())
-                }
-                TrayCmd::MenuClicked { id, .. } => {
-                    menu_clicked(&conn, &bus, &path, id).await;
-                    Ok(())
-                }
-            }
+            });
         });
     }
 }
@@ -891,8 +898,9 @@ async fn menu_clicked(conn: &Connection, bus: &str, sni_path: &str, id: i32) {
     };
     if let Ok(menu) = Proxy::new(conn, bus.to_string(), menu_path, DBUSMENU_IFACE).await {
         // data is an (ignored) empty variant; timestamp 0 is universally accepted.
+        // No reply expected — some apps never answer Event and would stall us.
         let _ = menu
-            .call::<_, _, ()>("Event", &(id, "clicked", Value::from(0i32), 0u32))
+            .call_noreply("Event", &(id, "clicked", Value::from(0i32), 0u32))
             .await;
     }
 }
