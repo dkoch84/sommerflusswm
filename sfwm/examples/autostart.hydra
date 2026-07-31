@@ -129,29 +129,38 @@ sc rule focus=on
 #  replaced by the built-in service.)
 
 # --- monitors: 4 physical + 2 raised overlay scratchpads ------------------------
-sc set_monitors 1440x2560+0+1876 4096x2160+1440+2160 1440x2560+5536+2160 3840x2160+1440+0
+# The fixed rects below assume river's outputs are arranged by the wlr-randr
+# call in ~/.config/river/init. Without wlr-randr the outputs sit at river's
+# default positions and the rects would point into the void (black screens) —
+# fall back to 1:1 autodetected monitors so the session stays usable.
+if command -v wlr-randr >/dev/null; then
+  sc set_monitors 1440x2560+0+1876 4096x2160+1440+2160 1440x2560+5536+2160 3840x2160+1440+0
 
-sc add_monitor 4096x2160+1440+2160 9 float2
-sc raise_monitor float2
-sc lock_tag 9 float2
-sc floating 9 on
-sc set_tag_monitor 9 float2
+  sc add_monitor 4096x2160+1440+2160 9 float2
+  sc raise_monitor float2
+  sc lock_tag 9 float2
+  sc floating 9 on
+  sc set_tag_monitor 9 float2
 
-sc add_monitor 3840x2160+1440+0 8 float1
-sc raise_monitor float1
-sc lock_tag 8 float1
-sc floating 8 on
-sc set_tag_monitor 8 float1
+  sc add_monitor 3840x2160+1440+0 8 float1
+  sc raise_monitor float1
+  sc lock_tag 8 float1
+  sc floating 8 on
+  sc set_tag_monitor 8 float1
 
-# padding (herbst pads: 36 top for the panel strip, 4 elsewhere). The native
-# bar sits on monitor 1; trim the other monitors' top pad if you don't want
-# the empty strip herbst always reserved.
-sc pad 0 36 4 4 4
-sc pad 1 36 4 4 4
-sc pad 2 36 4 4 4
-sc pad 3 36 4 4 4
-sc pad float2 36 4 4 4
-sc pad float1 36 4 4 4
+  # padding (herbst pads: 36 top for the panel strip, 4 elsewhere). The native
+  # bar sits on monitor 1; trim the other monitors' top pad if you don't want
+  # the empty strip herbst always reserved.
+  sc pad 0 36 4 4 4
+  sc pad 1 36 4 4 4
+  sc pad 2 36 4 4 4
+  sc pad 3 36 4 4 4
+  sc pad float2 36 4 4 4
+  sc pad float1 36 4 4 4
+else
+  sc detect_monitors
+  sc pad 0 36 4 4 4
+fi
 
 # --- notifications (built-in, replaces dunst) -----------------------------------
 sc set notify_bg '#f7f8f3'
