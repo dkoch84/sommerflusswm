@@ -1,0 +1,9 @@
+# xdg-desktop-portal-wlr configuration for sfwm sessions.
+# Installed by sommerflusswm at /etc/xdg/xdg-desktop-portal-wlr/config
+# (override per-user in ~/.config/xdg-desktop-portal-wlr/config).
+#
+# The default output/window chooser is slurp, which crashes under river —
+# use sfwm's built-in dmenu overlay (`sc menu`) instead.
+[screencast]
+chooser_type = dmenu
+chooser_cmd = sc menu

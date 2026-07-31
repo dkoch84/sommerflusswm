@@ -1,7 +1,7 @@
 # Maintainer: the sommerflusswm authors
 pkgname=sommerflusswm
 pkgver=0.1.0
-pkgrel=41
+pkgrel=43
 pkgdesc="herbstluftwm successor on river: sfwm window manager + sc control client (monitors, keybinds, frame tree, fullscreen/float/mouse/rules/borders/bar/wallpaper)"
 arch=('x86_64')
 url="https://github.com/dkoch84/sommerflusswm"
@@ -15,7 +15,7 @@ optdepends=('sommerflusswm-appearance: GUI wallpaper browser + icon-theme picker
             'slurp: screenshot region selection with window snapping'
             'satty: screenshot annotation UI'
             'wl-clipboard: copy screenshots to the clipboard'
-            'xdg-desktop-portal-wlr: screen sharing (Chrome/OBS screencast)')
+            'xdg-desktop-portal-wlr: screen + window sharing (>= 0.8.0 for windows)')
 makedepends=('rust' 'cargo')
 options=('!debug')
 source=("$pkgname-$pkgver.tar.gz")
@@ -73,6 +73,8 @@ package() {
 
     # Portal routing for screen sharing (Chrome/OBS → xdg-desktop-portal-wlr).
     install -Dm644 sfwm/examples/river-portals.conf "$pkgdir/usr/share/xdg-desktop-portal/river-portals.conf"
+    # Portal chooser: sc menu instead of slurp (which crashes under river).
+    install -Dm644 sfwm/examples/xdpw-config "$pkgdir/etc/xdg/xdg-desktop-portal-wlr/config"
 
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
