@@ -578,11 +578,17 @@ impl Rule {
     }
 }
 
-/// An interactive pointer operation in progress (move or resize a floating window).
+/// An interactive pointer operation in progress: move/resize a floating window,
+/// or (hlwm-style) resize the frame splits around a tiled window.
 struct PointerOp {
     win: WinId,
     resize: bool,
     start_geo: Rect,
+    /// Tiled-resize mode: op_delta drives Frame::resize on the window's tag
+    /// tree instead of the floating rect.
+    tiled: bool,
+    /// Last cumulative delta seen, to turn op_delta's totals into increments.
+    last_delta: (i32, i32),
 }
 
 /// A registered pointer binding.
@@ -1345,18 +1351,54 @@ impl State {
             }
         }
 
-        // Start/stop interactive pointer operations.
+        // Start/stop interactive pointer operations. hlwm semantics: mouse-move
+        // only acts on floating windows; mouse-resize resizes a floating window's
+        // rect, and on a tiled window adjusts the enclosing frame splits.
         for (seat, resize) in std::mem::take(&mut self.pending_op_start) {
             if let Some(wid) = self.pointer_focus {
-                let geo = self.last_rects.get(&wid).copied().unwrap_or_else(|| {
-                    Rect::new(self.pointer_pos.0, self.pointer_pos.1, 320, 240)
-                });
-                self.make_floating(wid, geo);
-                self.op = Some(PointerOp {
-                    win: wid,
-                    resize,
-                    start_geo: geo,
-                });
+                let floats = self.windows.get(&wid).map_or(false, |w| self.win_floats(w));
+                if !floats && !resize {
+                    continue; // tiled windows don't move by mouse
+                }
+                if floats {
+                    let geo = self
+                        .windows
+                        .get(&wid)
+                        .map(|w| w.float_geo)
+                        .filter(|g| g.w > 0 && g.h > 0)
+                        .or_else(|| self.last_rects.get(&wid).copied())
+                        .unwrap_or_else(|| {
+                            Rect::new(self.pointer_pos.0, self.pointer_pos.1, 320, 240)
+                        });
+                    // Pin the rect without forcing the per-window flag on windows
+                    // that only float via their tag (float-toggle must still
+                    // return them to tiling on their home tag).
+                    if self.windows.get(&wid).map_or(false, |w| w.floating) {
+                        self.make_floating(wid, geo);
+                    } else if let Some(w) = self.windows.get_mut(&wid) {
+                        w.float_geo = geo;
+                    }
+                    self.op = Some(PointerOp {
+                        win: wid,
+                        resize,
+                        start_geo: geo,
+                        tiled: false,
+                        last_delta: (0, 0),
+                    });
+                } else {
+                    // Tiled resize: drive the frame splits around this window.
+                    let tag = self.windows.get(&wid).map(|w| w.tag);
+                    if let Some(tree) = tag.and_then(|t| self.tags.get_mut(&t)) {
+                        tree.focus_window(wid);
+                    }
+                    self.op = Some(PointerOp {
+                        win: wid,
+                        resize: true,
+                        start_geo: Rect::new(0, 0, 0, 0),
+                        tiled: true,
+                        last_delta: (0, 0),
+                    });
+                }
                 seat.op_start_pointer();
             }
         }
@@ -3901,17 +3943,44 @@ impl Dispatch<RiverSeatV1, ()> for State {
             }
             // Interactive move/resize: op_delta is cumulative since op start.
             Event::OpDelta { dx, dy } => {
-                if let Some(op) = state.op.as_ref().map(|o| (o.win, o.resize, o.start_geo)) {
-                    let (win, resize, sg) = op;
-                    if let Some(w) = state.windows.get_mut(&win) {
-                        w.float_geo = if resize {
-                            Rect::new(sg.x, sg.y, (sg.w + dx).max(60), (sg.h + dy).max(40))
-                        } else {
-                            Rect::new(sg.x + dx, sg.y + dy, sg.w, sg.h)
-                        };
+                let Some((win, resize, sg, tiled, (ddx, ddy))) = state.op.as_mut().map(|o| {
+                    let (ldx, ldy) = o.last_delta;
+                    o.last_delta = (dx, dy);
+                    (o.win, o.resize, o.start_geo, o.tiled, (dx - ldx, dy - ldy))
+                }) else {
+                    return;
+                };
+                if tiled {
+                    // hlwm mouse resize on a tiled window: nudge the enclosing
+                    // frame splits by the pointer's incremental motion, as a
+                    // fraction of the monitor showing the window's tag.
+                    if let Some(tag) = state.windows.get(&win).map(|w| w.tag) {
+                        let area = state
+                            .monitors
+                            .list
+                            .iter()
+                            .find(|m| m.tag == tag)
+                            .map(|m| m.rect);
+                        if let (Some(area), Some(tree)) = (area, state.tags.get_mut(&tag)) {
+                            if ddx != 0 && area.w > 0 {
+                                let dir =
+                                    if ddx > 0 { frame::Dir::Right } else { frame::Dir::Left };
+                                tree.resize(dir, ddx.abs() as f64 / area.w as f64);
+                            }
+                            if ddy != 0 && area.h > 0 {
+                                let dir = if ddy > 0 { frame::Dir::Down } else { frame::Dir::Up };
+                                tree.resize(dir, ddy.abs() as f64 / area.h as f64);
+                            }
+                        }
                     }
-                    state.request_manage();
+                } else if let Some(w) = state.windows.get_mut(&win) {
+                    w.float_geo = if resize {
+                        Rect::new(sg.x, sg.y, (sg.w + dx).max(60), (sg.h + dy).max(40))
+                    } else {
+                        Rect::new(sg.x + dx, sg.y + dy, sg.w, sg.h)
+                    };
                 }
+                state.request_manage();
             }
             Event::OpRelease => {
                 state.pending_op_end.push(seat.clone());
