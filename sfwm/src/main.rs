@@ -1342,25 +1342,40 @@ impl State {
             }
         }
 
-        // Windows that float only because their tag is floating may never have
-        // been given a float rect (float_geo defaults to 0x0) — seed one from
-        // where they were last placed, or the default centred rect.
-        let needs_geo: Vec<WinId> = self
+        // Seed/repair float rects: a floating window (incl. floating-tag
+        // windows) whose rect is unset — or entirely OFF the monitor showing
+        // its tag — gets a centred rect on that monitor. Floats must live on
+        // their tag's monitor; seeding from the focused monitor or last tiled
+        // rect made scratchpad windows drift to whatever screen was active.
+        let needs_geo: Vec<(WinId, Rect)> = self
             .windows
             .iter()
-            .filter(|(_, w)| {
-                self.floating_tags.contains(&w.tag)
-                    && (w.float_geo.w <= 0 || w.float_geo.h <= 0)
+            .filter(|(_, w)| w.floating || self.floating_tags.contains(&w.tag))
+            .filter_map(|(wid, w)| {
+                let mon = self
+                    .monitors
+                    .list
+                    .iter()
+                    .filter(|m| m.tag == w.tag)
+                    .max_by_key(|m| m.z)
+                    .map(|m| m.rect)?;
+                let g = w.float_geo;
+                let degenerate = g.w <= 0 || g.h <= 0;
+                let off_mon = g.x + g.w <= mon.x
+                    || g.x >= mon.x + mon.w
+                    || g.y + g.h <= mon.y
+                    || g.y >= mon.y + mon.h;
+                (degenerate || off_mon).then(|| {
+                    let gw = if degenerate { (mon.w / 2).max(160) } else { g.w.min(mon.w) };
+                    let gh = if degenerate { (mon.h / 2).max(120) } else { g.h.min(mon.h) };
+                    (
+                        *wid,
+                        Rect::new(mon.x + (mon.w - gw) / 2, mon.y + (mon.h - gh) / 2, gw, gh),
+                    )
+                })
             })
-            .map(|(wid, _)| *wid)
             .collect();
-        for wid in needs_geo {
-            let geo = self
-                .last_rects
-                .get(&wid)
-                .copied()
-                .filter(|r| r.w > 0 && r.h > 0)
-                .unwrap_or_else(|| self.default_float_geo());
+        for (wid, geo) in needs_geo {
             if let Some(w) = self.windows.get_mut(&wid) {
                 w.float_geo = geo;
             }
@@ -3971,7 +3986,13 @@ impl Dispatch<RiverWindowManagerV1, ()> for State {
                 let wid = state.next_win;
                 state.next_win += 1;
                 state.win_by_obj.insert(id.id(), wid);
-                state.windows.insert(wid, Window::new(id, tag));
+                let mut win = Window::new(id, tag);
+                // New windows stack on top of existing floats — raise_seq 0
+                // would leave popups/dialogs of floating apps stuck BEHIND
+                // their parent forever.
+                win.raise_seq = state.next_raise;
+                state.next_raise += 1;
+                state.windows.insert(wid, win);
                 // New windows land in the focused frame of the focused tag's tree.
                 // Rules (which key on app_id/title) are applied once those arrive.
                 state.tag_tree_mut(tag).insert_window(wid);
