@@ -1,0 +1,220 @@
+#!/bin/sh
+# personal config: cubey — single 3440x1440 desktop with an Apple Magic
+# Trackpad (gestures work like a laptop). Personal program spawns.
+# NOT installed by the package.
+Mod=Super
+# sc helper scripts: user copies win, else the packaged ones
+S="$HOME/scripts/sfwm"
+[ -d "$S" ] || S=/usr/share/sommerflusswm
+sc keyunbind --all
+sc mouseunbind --all
+
+# programs (same keys as the herbstluftwm config)
+sc keybind $Mod-Return spawn alacritty
+sc keybind $Mod-apostrophe spawn "$HOME/work/projects/rat/rat"
+sc keybind $Mod-c spawn code
+sc keybind $Mod-q spawn qutebrowser
+sc keybind $Mod-w spawn qutebrowser.wrapper "https://youtube.com"
+sc keybind $Mod-v spawn "$HOME/scripts/utils/chrome-debug"
+sc keybind $Mod-b spawn microsoft-edge-stable
+sc keybind $Mod-e spawn qutebrowser.matrix "https://app.element.io/#/room/!UDQUAzsPpbcPRJevFT:matrix.org"
+sc keybind $Mod-t spawn "$HOME/scripts/utils/chromer" evergy
+sc keybind $Mod-d spawn dolphin --platformtheme qt6ct
+# screenshots: grim+slurp+satty, window-snapping region select (see screenshot.sh)
+sc keybind $Mod-Shift-s spawn "$S/screenshot.sh" gui
+sc keybind $Mod-Shift-f spawn "$S/screenshot.sh" gui "$HOME/shots"
+sc keybind $Mod-m       launcher
+sc keybind Alt-Tab      spawn "$S/window-switcher.sh"
+
+# media / fn keys
+# volume: dankvol where it exists, else PipeWire's wpctl (capped at 100%)
+sc keybind XF86AudioLowerVolume spawn sh -c "$HOME/scripts/utils/dankvol -s 2 || wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 2%-"
+sc keybind XF86AudioRaiseVolume spawn sh -c "$HOME/scripts/utils/dankvol -d 2 || wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 2%+"
+sc keybind XF86AudioMute        spawn wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
+# brightness: brightnessctl needs no setup (logind D-Bus); light as fallback
+sc keybind XF86MonBrightnessDown spawn sh -c "brightnessctl set 5%- || light -U 5"
+sc keybind XF86MonBrightnessUp   spawn sh -c "brightnessctl set +5% || light -A 5"
+
+# session
+sc keybind $Mod-Shift-q quit
+sc keybind $Mod-Shift-r reload
+
+# tags — if the tag is locked to a monitor via tags.N.my_monitor, focus that
+# monitor first (the hlwm chain trick, verbatim apart from hc->sc).
+for i in 1 2 3 4 5 6 7 8 9; do
+  sc new_attr string tags.$i.my_monitor 2>/dev/null
+  sc keybind "$Mod-$i" \
+    chain , silent substitute M tags.$i.my_monitor focus_monitor M \
+          , use "$i"
+  sc keybind "$Mod-Shift-$i" move "$i"
+done
+sc keybind $Mod-period use_index +1 --skip-visible
+sc keybind $Mod-comma  use_index -1 --skip-visible
+sc keybind $Mod-BackSpace cycle_monitor
+# drop the focused tag's monitor lock
+sc keybind $Mod-Shift-t remove_attr tags.focus.my_monitor
+
+# focus / move within the frame tree
+for p in "Left left" "Down down" "Up up" "Right right" "h left" "j down" "k up" "l right"; do
+  set -- $p
+  sc keybind "$Mod-$1"       focus "$2"
+  sc keybind "$Mod-Shift-$1" shift "$2"
+done
+
+# splits / resize / layouts / removal
+sc keybind $Mod-u split top  0.5
+sc keybind $Mod-o split left 0.5
+sc keybind $Mod-Control-space split explode
+sc keybind $Mod-Control-h resize left  0.03
+sc keybind $Mod-Control-j resize down  0.03
+sc keybind $Mod-Control-k resize up    0.03
+sc keybind $Mod-Control-l resize right 0.03
+sc keybind $Mod-Control-0 set_layout vertical
+sc keybind $Mod-Control-1 set_layout horizontal
+sc keybind $Mod-Control-2 set_layout max
+sc keybind $Mod-Control-3 set_layout grid
+sc keybind $Mod-space     cycle_layout
+sc keybind $Mod-r         remove
+sc keybind $Mod-g         cycle
+sc keybind $Mod-Tab       cycle_all +1
+sc keybind $Mod-Shift-Tab cycle_all -1
+sc keybind $Mod-i         jumpto urgent
+
+# scripts (sc ports of the herbst helpers)
+sc keybind $Mod-s spawn "$S/float-toggle.sh"
+sc keybind $Mod-z spawn "$S/resize-viewport.sh"
+
+# per-window modes
+sc keybind $Mod-Shift-c     close
+sc keybind $Mod-f           fullscreen toggle
+sc keybind $Mod-p           pseudotile toggle
+sc keybind $Mod-Shift-space floating toggle
+
+# mouse
+sc mousebind $Mod-Button1       move
+sc mousebind $Mod-Button2       zoom
+sc mousebind $Mod-Shift-Button1 resize
+
+# touchpad gestures (native libinput recognition; needs the user in the
+# `input` group — sfwm logs "gestures disabled" otherwise). Left/right cycle
+# tags like Mod-period/comma; up floats the window to the scratchpad, down
+# returns it (both via the float-toggle script, so the behavior is scriptable).
+sc gestureunbind --all
+sc gesturebind swipe3-left  use_index +1 --skip-visible
+sc gesturebind swipe3-right use_index -1 --skip-visible
+sc gesturebind swipe3-up    spawn "$S/float-toggle.sh"
+sc gesturebind swipe3-down  spawn "$S/float-toggle.sh"
+
+# theme
+sc set window_gap 8
+sc set border_width 2
+sc set border_color_active '#4e9bcf'
+sc set border_color_normal  '#1d252b'
+# dim unfocused windows in-WM (replaces picom's inactive-dim); 0 disables
+sc set inactive_dim 0.07
+
+# --- multi-monitor setup (optional; uncomment + edit rects for your displays) ---
+# sfwm auto-detects one monitor per output by default. To define VIRTUAL monitors
+# (rects that are NOT 1:1 with physical outputs) and overlapping tag-locked overlay
+# monitors — the hlwm-style scratchpad-over-a-panel trick — uncomment and adapt:
+#
+# # Four base monitors as explicit rects.
+# sc set_monitors 1440x2560+0+1876 4096x2160+1440+2160 1440x2560+5536+2160 3840x2160+1440+0
+# # Two OVERLAPPING overlay monitors on top of the 4K panels, raised, tag-locked.
+# # Toggling tag 9 / tag 8 pops a full-screen scratchpad over that panel.
+# sc add_monitor   4096x2160+1440+2160  9  float2
+# sc raise_monitor float2
+# sc lock_tag      9  float2
+# sc add_monitor   3840x2160+1440+0     8  float1
+# sc raise_monitor float1
+# sc lock_tag      8  float1
+# # Per-monitor bar padding (hlwm `pad <mon> <top> <right> <bottom> <left>`).
+# sc pad 0 36 4 4 4 ; sc pad 1 36 4 4 4 ; sc pad 2 36 4 4 4 ; sc pad 3 36 4 4 4
+# sc pad float2 36 4 4 4 ; sc pad float1 36 4 4 4
+
+# --- notifications (built-in, replaces dunst) — theme via `sc set notify_*` ------
+# Defaults shown; uncomment/edit to taste. notify_timeout is the default expiry in
+# ms for apps that don't set one (0 = sticky); critical notifications use the
+# accent_critical colour on their left bar.
+ sc set notify_bg              '#f7f8f3'
+ sc set notify_fg              '#1d252b'
+# sc set notify_body_fg         '#c9ccc4'
+# sc set notify_accent          '#4e9bcf'
+# sc set notify_accent_critical '#ff4d65'
+# sc set notify_width           380
+# sc set notify_timeout         5000
+
+
+# --- night light (wlsunset; replaces redshift) -----------------------------------
+# Coordinates come from weather.conf (LAT/LON) when present — not hard-coded here.
+if command -v wlsunset >/dev/null && ! pgrep -x wlsunset >/dev/null; then
+  CONF="${XDG_CONFIG_HOME:-$HOME/.config}/sommerflusswm/weather.conf"
+  [ -r "$CONF" ] && . "$CONF"
+  wlsunset ${LAT:+-l $LAT} ${LON:+-L $LON} &
+fi
+
+# --- wallpaper (drawn by sfwm itself; sc wallpaper needs sommerflusswm >= 15) ----
+# Solid colour as the baseline; if you've picked an image in the wallpaper browser
+# (run `sfwm-appearance`, from the separate sommerflusswm-appearance package),
+# --restore replays your saved choice on top of it.
+sc wallpaper color '#1d252b'
+command -v sfwm-appearance >/dev/null && sfwm-appearance --restore &
+
+# --- status bar (native, drawn by sfwm via a shell surface) --------------------
+# Reuses your tint2 executor scripts in ~/scripts/bar verbatim. Icon fonts must be
+# named explicitly (cosmic-text won't auto-fall-back to Private-Use-Area glyphs).
+B="$HOME/scripts/bar"
+[ -d "$B" ] || B=/usr/share/sommerflusswm/bar   # packaged copies
+TEXT='Iosevka Term'
+ICON='Font Awesome 7 Free Solid'
+
+# invisible separators (just spacing, like tint2's empty separator style)
+sep() { sc bar add separator size=10 style=empty; }
+
+sc bar create top height=28 marginx=8 marginy=8 bg='#f7f8f3' fg='#1d252b' font=13
+
+# left: focused tag in a pink box, then a STATUS-MARKER ROW for all 9 tags (tint2
+# style) — one marker per tag from `sc tag_status`: # focused · % visible elsewhere
+# · ! urgent · : occupied · . empty. Both are continuous executors that re-emit on
+# every sfwm hook (sc --idle), so they update instantly. (The tags ARE executors.)
+sc bar add executor \
+  "f(){ sc tag_status | tr '\t' '\n' | sed -n 's/^#//p'; }; f; sc --idle | while read -r _; do f; done" \
+  continuous family="$TEXT" bg='#db7681' fg='#f8f7f3' pad=12
+sc bar add executor \
+  "f(){ sc tag_status | tr '\t' '\n' | sed -E 's/[0-9]+//' | grep . | paste -sd' '; }; f; sc --idle | while read -r _; do f; done" \
+  continuous family="$TEXT" pad=8
+
+sc bar add spacer
+
+# system tray (SNI/StatusNotifierItem — sfwm is its own tray host; external trays
+# can't composite under sfwm). size=0 auto-fits the bar height. Clicks:
+# left = Activate, middle = SecondaryActivate, right = context menu, scroll = Scroll.
+
+# right cluster: tint2 panel order (text then icon), separators between groups.
+# NOTE: bar-vim still calls herbstclient on the VM — swap its hc calls to sc, or it
+# shows blank. The tag executors above are already ported (inline) so tags work now.
+sc bar add executor "$B/bar-weather"      interval=300 family="$TEXT"
+sc bar add executor "$B/bar-weather-icon" interval=300 family='Weather Icons'
+sep
+sc bar add executor "$B/bar-vim"          interval=1   family="$TEXT"
+sc bar add executor "$B/bar-vim-icon"                  family="$ICON"
+sep
+sc bar add executor "$B/bar-artist"       interval=2   family="$TEXT"
+sc bar add executor "$B/bar-artist-icon"               family="$ICON"
+sep
+sc bar add executor "$B/bar-music"        interval=2   family="$TEXT"
+sc bar add executor "$B/bar-music-icon"                family="$ICON"
+sep
+sc bar add executor "python $B/bar-cpu"   interval=3   family="$TEXT"
+sc bar add executor "$B/bar-cpu-icon"                  family="$ICON"
+sep
+sc bar add executor "$B/bar-date"         interval=500 family="$TEXT"
+sc bar add executor "$B/bar-date-icon"                 family="$ICON"
+sep
+sc bar add executor "$B/bar-clock"        interval=60  family="$TEXT"
+sc bar add executor "$B/bar-clock-icon"                family="$ICON"
+sep
+sc bar add tray size=0 spacing=6
+
+# reserve the bar's strip so tiled windows don't sit under it (height + 2*marginy).
+sc pad 0 36 0 0 0
