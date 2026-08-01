@@ -48,8 +48,9 @@ sc keybind Alt-Tab      spawn "$S/window-switcher.sh"
 # media / fn keys
 sc keybind XF86AudioLowerVolume spawn "$HOME/scripts/utils/dankvol" -s 2
 sc keybind XF86AudioRaiseVolume spawn "$HOME/scripts/utils/dankvol" -d 2
-sc keybind XF86MonBrightnessDown spawn /usr/bin/light -U 5
-sc keybind XF86MonBrightnessUp   spawn /usr/bin/light -A 5
+# brightness: brightnessctl needs no setup (logind D-Bus); light as fallback
+sc keybind XF86MonBrightnessDown spawn sh -c "brightnessctl set 5%- || light -U 5"
+sc keybind XF86MonBrightnessUp   spawn sh -c "brightnessctl set +5% || light -A 5"
 
 # session
 sc keybind $Mod-Shift-q quit
