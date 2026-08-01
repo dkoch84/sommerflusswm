@@ -44,6 +44,7 @@ use wayland_client::{
     globals::{registry_queue_init, GlobalListContents},
     protocol::{
         wl_buffer::WlBuffer, wl_compositor::WlCompositor, wl_keyboard::{self, WlKeyboard},
+        wl_output::{self, WlOutput},
         wl_pointer::{self, WlPointer},
         wl_registry, wl_seat::{self, WlSeat}, wl_shm, wl_shm::WlShm,
         wl_shm_pool::WlShmPool, wl_surface::WlSurface,
@@ -69,11 +70,12 @@ struct OutputInfo {
     output: RiverOutputV1,
     geo: OutputGeo,
     /// Numeric name of the corresponding `wl_output` global (from the
-    /// `river_output_v1.wl_output` event). Resolving this to a human output name
-    /// like "DP-1" requires binding the `wl_output` global and is deferred to a
-    /// later milestone; the monitor model only needs geometry, which we have.
+    /// `river_output_v1.wl_output` event). Bound so we can read its scale.
     #[allow(dead_code)]
     wl_output_name: Option<u32>,
+    /// Output scale factor from `wl_output.scale` (1 unless HiDPI). Chrome
+    /// surfaces render at this scale so they stay crisp.
+    scale: i32,
 }
 
 /// A managed window. It lives as a [`WinId`] leaf entry in its tag's frame tree;
@@ -648,6 +650,8 @@ struct KeyBind {
 /// so no locking is required.
 struct State {
     wm: Option<RiverWindowManagerV1>,
+    /// The core registry, kept to bind wl_output globals as river reports them.
+    registry: wl_registry::WlRegistry,
     /// A queue handle stored so the IPC/keypress paths can create protocol
     /// objects (nodes, key bindings) without one being threaded through.
     qh: QueueHandle<State>,
@@ -1237,6 +1241,22 @@ impl State {
         }
     }
 
+    /// The output scale for chrome drawn over `rect` (1 unless a HiDPI output
+    /// overlaps it). Chrome buffers render at this factor + set_buffer_scale.
+    fn scale_at(&self, rect: Rect) -> i32 {
+        self.outputs
+            .values()
+            .filter(|o| {
+                rect.x < o.geo.x + o.geo.w
+                    && rect.x + rect.w > o.geo.x
+                    && rect.y < o.geo.y + o.geo.h
+                    && rect.y + rect.h > o.geo.y
+            })
+            .map(|o| o.scale.max(1))
+            .max()
+            .unwrap_or(1)
+    }
+
     /// A reasonable default floating rect: centred half-size on the focused monitor.
     fn default_float_geo(&self) -> Rect {
         let a = self.focused_area();
@@ -1716,20 +1736,24 @@ impl State {
             self.font_system = Some(cosmic_text::FontSystem::new());
             self.swash_cache = Some(cosmic_text::SwashCache::new());
         }
-        // Take the font state out so we can borrow self.bar mutably alongside it.
+        // Take the font state out so we can borrow the bar mutably alongside it.
         let mut fs = self.font_system.take().unwrap();
         let mut sc = self.swash_cache.take().unwrap();
+        // HiDPI: lay out + draw in physical pixels; positions/hit zones stay
+        // logical (pointer events and node coords are logical).
+        let scl = self.scale_at(rect);
+        let scf = scl as f32;
         let bar = self.bars.get_mut(idx).unwrap();
 
-        let h = bar.height.max(1);
-        let w = (rect.w - 2 * bar.margin_x).max(1);
+        let h = bar.height.max(1) * scl;
+        let w = (rect.w - 2 * bar.margin_x).max(1) * scl;
         let x = rect.x + bar.margin_x;
         let y = match bar.anchor {
             DockAnchor::Top => rect.y + bar.margin_y,
-            DockAnchor::Bottom => rect.y + rect.h - h - bar.margin_y,
+            DockAnchor::Bottom => rect.y + rect.h - bar.height.max(1) - bar.margin_y,
         };
         bar.origin = (x, y);
-        let font_size = bar.font_size;
+        let font_size = bar.font_size * scf;
         // Render every item, including SNI "Passive" ones — many apps (appindicator,
         // nm-applet) sit in Passive and would otherwise never show.
         let tray_count = self.tray_items.len() as i32;
@@ -1744,18 +1768,18 @@ impl State {
         let mut spacers = 0i32;
         for m in &bar.modules {
             let wd = match m {
-                BarModule::Separator { size, .. } => *size,
+                BarModule::Separator { size, .. } => *size * scl,
                 BarModule::Spacer => {
                     spacers += 1;
                     0
                 }
                 BarModule::Executor(e) => {
-                    measure_text(&mut fs, &e.text, e.size.unwrap_or(font_size), e.family.as_deref())
-                        + 2 * e.pad
+                    let sz = e.size.map(|z| z * scf).unwrap_or(font_size);
+                    measure_text(&mut fs, &e.text, sz, e.family.as_deref()) + 2 * e.pad * scl
                 }
                 BarModule::Tray { size, spacing } => {
-                    let isize = if *size > 0 { *size } else { (h - 8).max(8) };
-                    tray_count * (isize + spacing)
+                    let isize = if *size > 0 { *size * scl } else { (h - 8 * scl).max(8) };
+                    tray_count * (isize + spacing * scl)
                 }
             };
             if !matches!(m, BarModule::Spacer) {
@@ -1774,12 +1798,13 @@ impl State {
             match m {
                 BarModule::Spacer => cx += spacer_w,
                 BarModule::Separator { size, color, style } => {
+                    let size = size * scl;
                     match style {
                         SepStyle::Line => {
-                            fill_rect(&mut data, w, h, cx + size / 2, h / 4, 1, (h / 2).max(1), *color);
+                            fill_rect(&mut data, w, h, cx + size / 2, h / 4, scl, (h / 2).max(1), *color);
                         }
                         SepStyle::Dot => {
-                            fill_rect(&mut data, w, h, cx + size / 2 - 1, h / 2 - 1, 2, 2, *color);
+                            fill_rect(&mut data, w, h, cx + size / 2 - scl, h / 2 - scl, 2 * scl, 2 * scl, *color);
                         }
                         SepStyle::Empty => {} // invisible: just the gap
                     }
@@ -1790,19 +1815,24 @@ impl State {
                         fill_rect(&mut data, w, h, cx, 0, *wd, h, bg);
                     }
                     let color = e.fg.unwrap_or(bar.fg);
-                    let sz = e.size.unwrap_or(font_size);
+                    let sz = e.size.map(|z| z * scf).unwrap_or(font_size);
                     let pen_y = ((h - sz as i32) / 2).max(0);
                     draw_text(
-                        &mut data, w, h, cx + e.pad, pen_y, &e.text, sz, color,
+                        &mut data, w, h, cx + e.pad * scl, pen_y, &e.text, sz, color,
                         e.family.as_deref(), &mut fs, &mut sc,
                     );
                     if e.lclick.is_some() || e.rclick.is_some() {
-                        hits.push(HitZone { x0: cx, x1: cx + *wd, kind: HitKind::Exec(e.id) });
+                        hits.push(HitZone {
+                            x0: cx / scl,
+                            x1: (cx + *wd + scl - 1) / scl,
+                            kind: HitKind::Exec(e.id),
+                        });
                     }
                     cx += *wd;
                 }
                 BarModule::Tray { size, spacing } => {
-                    let isize = if *size > 0 { *size } else { (h - 8).max(8) };
+                    let spacing = spacing * scl;
+                    let isize = if *size > 0 { *size * scl } else { (h - 8 * scl).max(8) };
                     let iy = ((h - isize) / 2).max(0);
                     for item in &self.tray_items {
                         match &item.icon {
@@ -1828,8 +1858,8 @@ impl State {
                             }
                         }
                         hits.push(HitZone {
-                            x0: cx,
-                            x1: cx + isize + spacing,
+                            x0: cx / scl,
+                            x1: (cx + isize + spacing + scl - 1) / scl,
                             kind: HitKind::Tray(item.key.clone()),
                         });
                         cx += isize + spacing;
@@ -1865,6 +1895,7 @@ impl State {
         // Commit synced to render_finish (protocol: sync_next_commit, then commit
         // the surface, both before render_finish).
         bar.shell.sync_next_commit();
+        bar.surface.set_buffer_scale(scl);
         if let Some(buf) = &bar.buffer {
             bar.surface.attach(Some(buf), 0, 0);
             bar.surface.damage_buffer(0, 0, w, h);
@@ -2138,6 +2169,10 @@ impl State {
         const MAXW: i32 = 460;
 
         let mon = self.tray_menu.as_ref().unwrap().mon;
+        // HiDPI: layout + hit geometry stay logical; drawing happens at
+        // physical resolution below.
+        let scl = self.scale_at(mon);
+        let scf = scl as f32;
         let w = mon.w.max(1);
         let h = mon.h.max(1);
         let ax = self.tray_menu.as_ref().unwrap().anchor.0 - mon.x;
@@ -2159,7 +2194,10 @@ impl State {
             let mut textw = 0;
             for n in nodes.iter() {
                 if !n.is_separator {
-                    textw = textw.max(measure_text(&mut fs, &n.label, FONT, None));
+                    // Measure at the physical size, book-keep logical (ceil) so
+                    // the scaled drawing can't overflow the column.
+                    let phys = measure_text(&mut fs, &n.label, FONT * scf, None);
+                    textw = textw.max((phys + scl - 1) / scl);
                 }
             }
             let iconw = if has_icon { ICONW } else { 0 };
@@ -2209,20 +2247,24 @@ impl State {
         };
 
         if self.tray_menu.as_ref().unwrap().last_sig != Some(sig) {
-            let mut data = vec![0u8; w as usize * h as usize * 4]; // transparent backdrop
+            let (pw, ph) = (w * scl, h * scl); // physical buffer dims
+            let mut data = vec![0u8; pw as usize * ph as usize * 4]; // transparent backdrop
             for (ci, col) in columns.iter().enumerate() {
                 let nodes = &cols_nodes[ci];
                 let has_icon = nodes.iter().any(|n| n.icon.is_some());
                 let iconw = if has_icon { ICONW } else { 0 };
+                // Scaled column geometry (layout is logical; draw physical).
+                let (colx, coly, colw, colh) = (col.x * scl, col.y * scl, col.w * scl, col.h * scl);
                 // border + background box
-                fill_rect(&mut data, w, h, col.x - 1, col.y - 1, col.w + 2, col.h + 2, BORDER);
-                fill_rect(&mut data, w, h, col.x, col.y, col.w, col.h, BG);
+                fill_rect(&mut data, pw, ph, colx - scl, coly - scl, colw + 2 * scl, colh + 2 * scl, BORDER);
+                fill_rect(&mut data, pw, ph, colx, coly, colw, colh, BG);
 
                 for (ri, node) in nodes.iter().enumerate() {
                     let row = &col.rows[ri];
+                    let (ry0, ry1) = (row.y0 * scl, row.y1 * scl);
                     if node.is_separator {
-                        let sy = row.y0 + (row.y1 - row.y0) / 2;
-                        fill_rect(&mut data, w, h, col.x + PADX, sy, col.w - 2 * PADX, 1, SEP);
+                        let sy = ry0 + (ry1 - ry0) / 2;
+                        fill_rect(&mut data, pw, ph, colx + PADX * scl, sy, colw - 2 * PADX * scl, scl, SEP);
                         continue;
                     }
                     let on_path = ci < open_path.len() && open_path[ci] == ri;
@@ -2235,30 +2277,31 @@ impl State {
                         FG
                     };
                     if highlight {
-                        fill_rect(&mut data, w, h, col.x, row.y0, col.w, ROW, SEL_BG);
+                        fill_rect(&mut data, pw, ph, colx, ry0, colw, ROW * scl, SEL_BG);
                     }
                     // toggle indicator
                     if node.toggle_type != 0 {
                         draw_toggle(
                             &mut data,
-                            w,
-                            h,
-                            col.x + PADX,
-                            row.y0 + (ROW - 12) / 2,
+                            pw,
+                            ph,
+                            colx + PADX * scl,
+                            ry0 + (ROW - 12) * scl / 2,
                             node.toggle_state == 1,
                             fg,
+                            scl,
                         );
                     }
                     // row icon
                     if has_icon {
                         if let Some(icon) = &node.icon {
-                            let isz = ROW - 8;
+                            let isz = (ROW - 8) * scl;
                             draw_icon(
                                 &mut data,
-                                w,
-                                h,
-                                col.x + PADX + TOGW,
-                                row.y0 + (ROW - isz) / 2,
+                                pw,
+                                ph,
+                                colx + (PADX + TOGW) * scl,
+                                ry0 + (ROW * scl - isz) / 2,
                                 isz,
                                 icon,
                             );
@@ -2267,12 +2310,12 @@ impl State {
                     // label
                     draw_text(
                         &mut data,
-                        w,
-                        h,
-                        col.x + PADX + TOGW + iconw,
-                        row.y0 + (ROW - 15) / 2,
+                        pw,
+                        ph,
+                        colx + (PADX + TOGW + iconw) * scl,
+                        ry0 + (ROW - 15) * scl / 2,
                         &node.label,
-                        FONT,
+                        FONT * scf,
                         fg,
                         None,
                         &mut fs,
@@ -2280,11 +2323,11 @@ impl State {
                     );
                     // submenu arrow (a small right-pointing triangle)
                     if node.has_submenu {
-                        let tx = col.x + col.w - PADX - 5;
-                        let tcy = row.y0 + ROW / 2;
-                        for i in 0..5 {
-                            let half = 4 - i;
-                            fill_rect(&mut data, w, h, tx + i, tcy - half, 1, 2 * half + 1, fg);
+                        let tx = colx + colw - (PADX + 5) * scl;
+                        let tcy = ry0 + ROW * scl / 2;
+                        for i in 0..(5 * scl) {
+                            let half = 4 * scl - i;
+                            fill_rect(&mut data, pw, ph, tx + i, tcy - half, 1, 2 * half + 1, fg);
                         }
                     }
                 }
@@ -2303,11 +2346,12 @@ impl State {
                 Ok(file) => {
                     let pool = shm.create_pool(file.as_fd(), data.len() as i32, qh, ());
                     let buffer =
-                        pool.create_buffer(0, w, h, w * 4, wl_shm::Format::Argb8888, qh, ());
+                        pool.create_buffer(0, pw, ph, pw * 4, wl_shm::Format::Argb8888, qh, ());
                     pool.destroy();
                     menu.shell.sync_next_commit();
+                    menu.surface.set_buffer_scale(scl);
                     menu.surface.attach(Some(&buffer), 0, 0);
-                    menu.surface.damage_buffer(0, 0, w, h);
+                    menu.surface.damage_buffer(0, 0, pw, ph);
                     menu.surface.commit();
                     menu.buffer = Some(buffer);
                     menu.backing = Some(file);
@@ -2485,12 +2529,16 @@ impl State {
             .enumerate()
             .map(|(i, m)| (i, m.rect))
             .collect();
+        // Chrome scale per monitor (HiDPI): render at physical resolution.
+        let scales: HashMap<usize, i32> =
+            rects.iter().map(|(i, r)| (*i, self.scale_at(*r))).collect();
         for (idx, wp) in self.wallpapers.iter_mut() {
             let Some(rect) = rects.get(idx).copied() else {
                 continue;
             };
-            let w = rect.w.max(1);
-            let h = rect.h.max(1);
+            let sc = scales.get(idx).copied().unwrap_or(1);
+            let w = rect.w.max(1) * sc;
+            let h = rect.h.max(1) * sc;
             let sig = (w, h, content_sig(&wp.content));
             if wp.last_sig != Some(sig) {
                 let data = render_wallpaper_pixels(&wp.content, w, h);
@@ -2508,6 +2556,7 @@ impl State {
                             pool.create_buffer(0, w, h, w * 4, wl_shm::Format::Argb8888, qh, ());
                         pool.destroy();
                         wp.shell.sync_next_commit();
+                        wp.surface.set_buffer_scale(sc);
                         wp.surface.attach(Some(&buffer), 0, 0);
                         wp.surface.damage_buffer(0, 0, w, h);
                         wp.surface.commit();
@@ -2688,45 +2737,57 @@ impl State {
         let mut sc = self.swash_cache.take().unwrap();
         let theme = self.notif_theme;
 
-        let w_box = theme.width.max(120);
+        // HiDPI: rasterize at physical resolution; stacking stays logical.
+        let scl = self.scale_at(rect);
+        let scf = scl as f32;
+        let w_box = theme.width.max(120); // logical
+        let w_phys = w_box * scl;
         const PAD: i32 = 12;
         const ACCENT: i32 = 4;
         const MARGIN: i32 = 12;
         const GAP: i32 = 8;
         const SUMMARY: f32 = 15.0;
         const BODY: f32 = 13.0;
-        let wrap_w = (w_box - 2 * PAD - ACCENT) as f32;
+        let pad = PAD * scl;
+        let accent_w = ACCENT * scl;
+        let summary_sz = SUMMARY * scf;
+        let body_sz = BODY * scf;
+        let wrap_w = (w_phys - 2 * pad - accent_w) as f32;
 
         // Build any popup that hasn't been rasterized yet (also sets its height).
         for n in self.notifications.iter_mut() {
             if n.buffer.is_some() {
                 continue;
             }
-            let (_, body_lines) = measure_wrapped(&mut fs, &n.body, BODY, wrap_w);
-            let summary_h = (SUMMARY * 1.35).ceil() as i32;
+            let (_, body_lines) = measure_wrapped(&mut fs, &n.body, body_sz, wrap_w);
+            let summary_h = (summary_sz * 1.35).ceil() as i32;
             let body_h = if n.body.is_empty() {
                 0
             } else {
-                (body_lines as f32 * (BODY * 1.35)).ceil() as i32
+                (body_lines as f32 * (body_sz * 1.35)).ceil() as i32
             };
-            let gap = if n.body.is_empty() { 0 } else { 6 };
-            let h = (PAD + summary_h + gap + body_h + PAD).max(40);
+            let gap = if n.body.is_empty() { 0 } else { 6 * scl };
+            // Physical height, rounded up to a multiple of the scale so the
+            // compositor accepts the buffer at this scale.
+            let mut h = (pad + summary_h + gap + body_h + pad).max(40 * scl);
+            h = (h + scl - 1) / scl * scl;
 
-            let mut data = vec![0u8; w_box as usize * h as usize * 4];
-            fill_rect(&mut data, w_box, h, 0, 0, w_box, h, theme.bg);
+            let mut data = vec![0u8; w_phys as usize * h as usize * 4];
+            fill_rect(&mut data, w_phys, h, 0, 0, w_phys, h, theme.bg);
             let accent = if n.urgency == 2 {
                 theme.accent_critical
             } else {
                 theme.accent
             };
-            fill_rect(&mut data, w_box, h, 0, 0, ACCENT, h, accent);
-            let tx0 = PAD + ACCENT;
+            fill_rect(&mut data, w_phys, h, 0, 0, accent_w, h, accent);
+            let tx0 = pad + accent_w;
             draw_text(
-                &mut data, w_box, h, tx0, PAD, &n.summary, SUMMARY, theme.fg, None, &mut fs, &mut sc,
+                &mut data, w_phys, h, tx0, pad, &n.summary, summary_sz, theme.fg, None, &mut fs,
+                &mut sc,
             );
             if !n.body.is_empty() {
                 draw_wrapped(
-                    &mut data, w_box, h, tx0, PAD + summary_h + gap, &n.body, BODY,
+                    &mut data, w_phys, h, tx0, pad + summary_h + gap, &n.body, body_sz,
                     theme.body_fg, wrap_w, &mut fs, &mut sc,
                 );
             }
@@ -2734,16 +2795,17 @@ impl State {
                 Ok(file) => {
                     let pool = shm.create_pool(file.as_fd(), data.len() as i32, qh, ());
                     let buffer = pool.create_buffer(
-                        0, w_box, h, w_box * 4, wl_shm::Format::Argb8888, qh, (),
+                        0, w_phys, h, w_phys * 4, wl_shm::Format::Argb8888, qh, (),
                     );
                     pool.destroy();
                     n.shell.sync_next_commit();
+                    n.surface.set_buffer_scale(scl);
                     n.surface.attach(Some(&buffer), 0, 0);
-                    n.surface.damage_buffer(0, 0, w_box, h);
+                    n.surface.damage_buffer(0, 0, w_phys, h);
                     n.surface.commit();
                     n.buffer = Some(buffer);
                     n.backing = Some(file);
-                    n.height = h;
+                    n.height = h / scl; // logical, for stacking
                 }
                 Err(e) => eprintln!("sfwm: notification: shm buffer failed: {e}"),
             }
@@ -3026,7 +3088,8 @@ impl State {
             let r = self.region.as_ref().unwrap();
             (r.mon, r.cur, r.drag)
         };
-        let (w, h) = (mon.w.max(1), mon.h.max(1));
+        let sc = self.scale_at(mon);
+        let (w, h) = (mon.w.max(1) * sc, mon.h.max(1) * sc);
 
         // The highlighted rect, surface-local: the drag rect, else the snap box.
         let sel: Option<(i32, i32, i32, i32)> = match drag {
@@ -3058,6 +3121,8 @@ impl State {
             let dim = (0x00u8, 0x00u8, 0x00u8, 0x66u8);
             let border = self.launcher_theme.sel_bg;
             let mut data = vec![0u8; w as usize * h as usize * 4];
+            // Selection is tracked in logical coords; draw at physical.
+            let sel = sel.map(|(x, y, sw, sh)| (x * sc, y * sc, sw * sc, sh * sc));
             match sel {
                 None => fill_rect(&mut data, w, h, 0, 0, w, h, dim),
                 Some((sx, sy, sw, sh)) => {
@@ -3066,8 +3131,8 @@ impl State {
                     fill_rect(&mut data, w, h, 0, sy + sh, w, h - sy - sh, dim);
                     fill_rect(&mut data, w, h, 0, sy, sx, sh, dim);
                     fill_rect(&mut data, w, h, sx + sw, sy, w - sx - sw, sh, dim);
-                    // 2px border.
-                    let bw = 2;
+                    // 2px (logical) border.
+                    let bw = 2 * sc;
                     fill_rect(&mut data, w, h, sx - bw, sy - bw, sw + 2 * bw, bw, border);
                     fill_rect(&mut data, w, h, sx - bw, sy + sh, sw + 2 * bw, bw, border);
                     fill_rect(&mut data, w, h, sx - bw, sy, bw, sh, border);
@@ -3090,6 +3155,7 @@ impl State {
                     let buffer = pool.create_buffer(0, w, h, w * 4, wl_shm::Format::Argb8888, qh, ());
                     pool.destroy();
                     r.shell.sync_next_commit();
+                    r.surface.set_buffer_scale(sc);
                     r.surface.attach(Some(&buffer), 0, 0);
                     r.surface.damage_buffer(0, 0, w, h);
                     r.surface.commit();
@@ -3124,16 +3190,19 @@ impl State {
         let Some(rect) = mon.map(|m| m.rect) else {
             return;
         };
-        let w = rect.w.max(1);
-        let h = rect.h.max(1);
+        // HiDPI: lay out and draw in physical pixels, present at buffer scale.
+        let scl = self.scale_at(rect);
+        let scf = scl as f32;
+        let w = rect.w.max(1) * scl;
+        let h = rect.h.max(1) * scl;
 
-        const QBOX: i32 = 52; // search box height
-        const ROW: i32 = 36; // result row height
-        let pw = (w - 160).clamp(240, self.launcher_theme.width.max(240));
+        let qbox: i32 = 52 * scl; // search box height
+        let row: i32 = 36 * scl; // result row height
+        let pw = (w - 160 * scl).clamp(240 * scl, self.launcher_theme.width.max(240) * scl);
         let px = (w - pw) / 2;
         let py = h / 6;
-        let list_top = py + QBOX + 8;
-        let vis = (((h - list_top - 40).max(ROW)) / ROW).max(1) as usize;
+        let list_top = py + qbox + 8 * scl;
+        let vis = (((h - list_top - 40 * scl).max(row)) / row).max(1) as usize;
 
         // Keep the selection visible.
         {
@@ -3165,37 +3234,41 @@ impl State {
             let t = self.launcher_theme;
             let mut data = vec![0u8; w as usize * h as usize * 4];
             fill_rect(&mut data, w, h, 0, 0, w, h, t.dim); // dim backdrop
-            fill_rect(&mut data, w, h, px, py, pw, QBOX, t.bg); // search box
+            fill_rect(&mut data, w, h, px, py, pw, qbox, t.bg); // search box
             {
                 let l = self.launcher.as_ref().unwrap();
-                let qy = py + (QBOX - 22) / 2;
+                let qy = py + (qbox - 22 * scl) / 2;
                 if l.query.is_empty() {
                     let hint = (t.fg.0, t.fg.1, t.fg.2, 0x60); // faded query hint
                     draw_text(
-                        &mut data, w, h, px + 16, qy, "Type to search…", 22.0, hint, None,
-                        &mut fs, &mut sc,
+                        &mut data, w, h, px + 16 * scl, qy, "Type to search…", 22.0 * scf, hint,
+                        None, &mut fs, &mut sc,
                     );
                 } else {
                     draw_text(
-                        &mut data, w, h, px + 16, qy, &l.query, 22.0, t.fg, None, &mut fs, &mut sc,
+                        &mut data, w, h, px + 16 * scl, qy, &l.query, 22.0 * scf, t.fg, None,
+                        &mut fs, &mut sc,
                     );
-                    let cw = measure_text(&mut fs, &l.query, 22.0, None);
-                    fill_rect(&mut data, w, h, px + 18 + cw, py + 12, 2, QBOX - 24, t.sel_bg);
+                    let cw = measure_text(&mut fs, &l.query, 22.0 * scf, None);
+                    fill_rect(
+                        &mut data, w, h, px + 18 * scl + cw, py + 12 * scl, 2 * scl,
+                        qbox - 24 * scl, t.sel_bg,
+                    );
                 }
                 let end = (l.scroll + vis).min(l.matches.len());
-                for (row, mi) in (l.scroll..end).enumerate() {
+                for (rown, mi) in (l.scroll..end).enumerate() {
                     let ai = l.matches[mi];
-                    let ry = list_top + row as i32 * ROW;
+                    let ry = list_top + rown as i32 * row;
                     let selected = mi == l.selected;
                     let (bg, fg) = if selected {
                         (t.sel_bg, t.sel_fg)
                     } else {
                         (t.bg, t.fg)
                     };
-                    fill_rect(&mut data, w, h, px, ry, pw, ROW, bg);
+                    fill_rect(&mut data, w, h, px, ry, pw, row, bg);
                     draw_text(
-                        &mut data, w, h, px + 16, ry + (ROW - 16) / 2, &l.entries[ai], 16.0,
-                        fg, None, &mut fs, &mut sc,
+                        &mut data, w, h, px + 16 * scl, ry + (row - 16 * scl) / 2, &l.entries[ai],
+                        16.0 * scf, fg, None, &mut fs, &mut sc,
                     );
                 }
             }
@@ -3215,6 +3288,7 @@ impl State {
                     let buffer = pool.create_buffer(0, w, h, w * 4, wl_shm::Format::Argb8888, qh, ());
                     pool.destroy();
                     l.shell.sync_next_commit();
+                    l.surface.set_buffer_scale(scl);
                     l.surface.attach(Some(&buffer), 0, 0);
                     l.surface.damage_buffer(0, 0, w, h);
                     l.surface.commit();
@@ -3577,14 +3651,15 @@ fn menu_hit(columns: &[MenuColumn], sx: i32, sy: i32) -> Option<(usize, usize)> 
 
 /// Draw a 12×12 checkbox/radio indicator at (`x`,`y`): a box outline, filled in
 /// the centre when `on`. Same glyph for check and radio (kept font-free/reliable).
-fn draw_toggle(dst: &mut [u8], dw: i32, dh: i32, x: i32, y: i32, on: bool, c: (u8, u8, u8, u8)) {
-    const S: i32 = 12;
-    fill_rect(dst, dw, dh, x, y, S, 1, c);
-    fill_rect(dst, dw, dh, x, y + S - 1, S, 1, c);
-    fill_rect(dst, dw, dh, x, y, 1, S, c);
-    fill_rect(dst, dw, dh, x + S - 1, y, 1, S, c);
+fn draw_toggle(dst: &mut [u8], dw: i32, dh: i32, x: i32, y: i32, on: bool, c: (u8, u8, u8, u8), scl: i32) {
+    let s = 12 * scl;
+    let t = scl; // line thickness
+    fill_rect(dst, dw, dh, x, y, s, t, c);
+    fill_rect(dst, dw, dh, x, y + s - t, s, t, c);
+    fill_rect(dst, dw, dh, x, y, t, s, c);
+    fill_rect(dst, dw, dh, x + s - t, y, t, s, c);
     if on {
-        fill_rect(dst, dw, dh, x + 3, y + 3, S - 6, S - 6, c);
+        fill_rect(dst, dw, dh, x + 3 * scl, y + 3 * scl, s - 6 * scl, s - 6 * scl, c);
     }
 }
 
@@ -3813,6 +3888,7 @@ fn main() {
 
     let mut state = State {
         wm: Some(wm),
+        registry: globals.registry().clone(),
         qh: qh.clone(),
         outputs: HashMap::new(),
         windows: HashMap::new(),
@@ -4050,6 +4126,7 @@ impl Dispatch<RiverWindowManagerV1, ()> for State {
                         output: id,
                         geo: OutputGeo::default(),
                         wl_output_name: None,
+                        scale: 1,
                     },
                 );
                 wm.manage_dirty();
@@ -4143,7 +4220,7 @@ impl Dispatch<RiverOutputV1, ()> for State {
         event: river_output_v1::Event,
         _: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
     ) {
         use river_output_v1::Event;
         let id = out.id();
@@ -4166,6 +4243,9 @@ impl Dispatch<RiverOutputV1, ()> for State {
                 if let Some(o) = state.outputs.get_mut(&id) {
                     o.wl_output_name = Some(name);
                 }
+                // Bind the core wl_output to learn its scale (v2+ has the
+                // `scale` event); user data links it back to this river output.
+                let _wl: WlOutput = state.registry.bind(name, 2, qh, id.clone());
             }
             Event::Removed => {
                 state.outputs.remove(&id);
@@ -4174,6 +4254,26 @@ impl Dispatch<RiverOutputV1, ()> for State {
                 state.request_manage();
             }
             _ => {}
+        }
+    }
+}
+
+impl Dispatch<WlOutput, ObjectId> for State {
+    fn event(
+        state: &mut Self,
+        _out: &WlOutput,
+        event: wl_output::Event,
+        river_output_id: &ObjectId,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_output::Event::Scale { factor } = event {
+            if let Some(o) = state.outputs.get_mut(river_output_id) {
+                if o.scale != factor.max(1) {
+                    o.scale = factor.max(1);
+                    state.request_manage();
+                }
+            }
         }
     }
 }
