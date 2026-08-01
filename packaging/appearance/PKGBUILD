@@ -4,7 +4,7 @@
 # eframe/egui/OpenGL stack. (Formerly sommerflusswm-wallpaper.)
 pkgname=sommerflusswm-appearance
 pkgver=0.1.0
-pkgrel=2
+pkgrel=6
 pkgdesc="sommerflusswm appearance GUI: wallpaper browser + icon-theme picker (drives 'sc wallpaper' and qt6ct)"
 arch=('x86_64')
 url="https://github.com/dkoch84/sommerflusswm"
