@@ -46,8 +46,10 @@ sc keybind $Mod-m       launcher
 sc keybind Alt-Tab      spawn "$S/window-switcher.sh"
 
 # media / fn keys
-sc keybind XF86AudioLowerVolume spawn "$HOME/scripts/utils/dankvol" -s 2
-sc keybind XF86AudioRaiseVolume spawn "$HOME/scripts/utils/dankvol" -d 2
+# volume: dankvol where it exists, else PipeWire's wpctl (capped at 100%)
+sc keybind XF86AudioLowerVolume spawn sh -c "$HOME/scripts/utils/dankvol -s 2 || wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 2%-"
+sc keybind XF86AudioRaiseVolume spawn sh -c "$HOME/scripts/utils/dankvol -d 2 || wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 2%+"
+sc keybind XF86AudioMute        spawn wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
 # brightness: brightnessctl needs no setup (logind D-Bus); light as fallback
 sc keybind XF86MonBrightnessDown spawn sh -c "brightnessctl set 5%- || light -U 5"
 sc keybind XF86MonBrightnessUp   spawn sh -c "brightnessctl set +5% || light -A 5"
@@ -215,6 +217,15 @@ sep
 sc bar add tray size=0 spacing=6
 }
 for m in 0 1 2 3; do full_bar "$m"; done
+
+
+# --- night light (wlsunset; replaces redshift) -----------------------------------
+# Coordinates come from weather.conf (LAT/LON) when present — not hard-coded here.
+if command -v wlsunset >/dev/null && ! pgrep -x wlsunset >/dev/null; then
+  CONF="${XDG_CONFIG_HOME:-$HOME/.config}/sommerflusswm/weather.conf"
+  [ -r "$CONF" ] && . "$CONF"
+  wlsunset ${LAT:+-l $LAT} ${LON:+-L $LON} &
+fi
 
 # --- RGB ------------------------------------------------------------------------
 liquidctl --match aura set sync color static 5930fc &
